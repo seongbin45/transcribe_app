@@ -1,0 +1,31 @@
+# torch/torchaudio를 CPU 전용 휠로 받기 위한 추가 인덱스 (NVIDIA CUDA가 아닌 GPU 환경 포함)
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# === 1단계: GUI 스캐폴드 ===
+PySide6>=6.7
+
+# === 2단계: 로컬 STT ===
+# faster-whisper는 CTranslate2 백엔드라 NVIDIA CUDA/CPU만 지원.
+# Intel Arc GPU는 지원 대상이 아니라 device="cpu"로 사용 (추후 OpenVINO 등으로 가속 검토 가능).
+faster-whisper>=1.2
+
+# === 3단계: 화자분리 ===
+# 아래 버전들은 서로 맞물려 있어 함부로 올리면 깨짐 (실제로 겪은 문제들):
+#  - pyannote.audio 4.x는 pyannote/speaker-diarization-community-1 이라는 별도 gated 모델을
+#    추가로 요구해서 4.x 대신 3.3.2(=3.1 파이프라인, segmentation-3.0만 필요) 사용
+#  - torchaudio 2.9+는 pyannote 3.3.2가 쓰는 구버전 오디오 I/O API(AudioMetaData)를 제거함
+#  - torch 2.6+는 torch.load(weights_only=True)가 기본값이 되어 pyannote 체크포인트 로드가 막힘
+#  - huggingface_hub 1.x는 pyannote 3.3.2가 쓰는 use_auth_token 인자를 제거함
+# 그래서 torch/torchaudio는 2.5.1, huggingface_hub는 0.25.2로 고정.
+torch==2.5.1
+torchaudio==2.5.1
+huggingface_hub==0.25.2
+pyannote.audio==3.3.2
+python-dotenv>=1.0
+
+# === 4단계: 문서 출력 ===
+python-docx>=1.1
+
+# === 5단계: 설정/API 키 저장 ===
+keyring>=25.0
+# requests는 faster-whisper/huggingface_hub 등의 의존성으로 이미 설치되어 있음 (AssemblyAI 엔진에서 사용)

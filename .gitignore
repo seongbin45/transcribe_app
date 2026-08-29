@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+settings.json
+models/*
+!models/.gitkeep
+output/*
+!output/.gitkeep
+*.wav
