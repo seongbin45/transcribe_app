@@ -132,3 +132,34 @@ def configured_providers(environ: Mapping[str, str] | None = None) -> tuple[str,
     """`.env`에 키가 있어서 실제로 쓸 수 있는 제공자 id들 (PROVIDER_IDS 순서)."""
     env = environ if environ is not None else os.environ
     return tuple(pid for pid in PROVIDER_IDS if resolve_provider(pid, env) is not None)
+
+
+# 이 앱 전용 슬롯(레지스트리에는 없음): 무료 티어 Gemini 키, 항상 맨 앞.
+SLOT_IDS = ("gemini_free", *PROVIDER_IDS)
+
+SLOT_LABELS = {
+    "gemini_free": "Gemini (무료 키)",
+    "gemini": "Gemini",
+    "claude": "Claude",
+    "openai": "OpenAI",
+    "xai": "xAI",
+}
+
+
+def resolve_slot(slot: str, environ: Mapping[str, str] | None = None) -> ResolvedProvider | None:
+    """PROVIDER_IDS(xai/openai/gemini/claude) + 이 앱 전용 'gemini_free' 슬롯을 통합 해석.
+
+    gemini_free는 레지스트리에 없는 이 앱만의 슬롯이라 여기서 특별 취급한다
+    (API 포맷은 gemini와 동일해서 ResolvedProvider.id="gemini"로 만든다).
+    """
+    if slot == "gemini_free":
+        key = _secrets.get_api_key("gemini_free")
+        if not key:
+            return None
+        return ResolvedProvider(id="gemini", model=None, api_key=key, base_url=None, key_env="GEMINI_FREE_KEY")
+    return resolve_provider(slot, environ)
+
+
+def configured_slots(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """키가 있어서 실제로 쓸 수 있는 슬롯들 (gemini_free 포함, SLOT_IDS 순서)."""
+    return tuple(slot for slot in SLOT_IDS if resolve_slot(slot, environ) is not None)

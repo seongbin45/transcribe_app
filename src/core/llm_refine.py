@@ -31,8 +31,7 @@ import requests
 from .align import SpeakerTranscriptSegment
 from .llm_call import call_llm
 from .llm_catalog import clear_selected_model, ensure_selected_model
-from .llm_providers import ResolvedProvider, resolve_provider
-from .secrets import get_api_key as get_app_api_key
+from .llm_providers import ResolvedProvider, resolve_slot
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +45,10 @@ RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 _RETRY_BASE_DELAY = 2.0
 _RETRY_MAX_DELAY = 15.0
 
-# gemini_free를 제외한 레지스트리 폴백 순서. Gemini 다음으로는 추론 품질이 검증된
-# Claude, OpenAI를 먼저 시도하고 xAI를 마지막으로 둔다.
-FALLBACK_ORDER = ("gemini", "claude", "openai", "xai")
+# 화자 병합 제안에 쓸 폴백 순서 (core/llm_providers.py의 SLOT_IDS는 레지스트리 나열 순서일
+# 뿐이라 여기서 별도로 우선순위를 정한다). 무료 Gemini 다음으로는 같은 Gemini(일반 키),
+# 그다음 추론 품질이 검증된 Claude, OpenAI를 먼저 시도하고 xAI를 마지막으로 둔다.
+FALLBACK_ORDER = ("gemini_free", "gemini", "claude", "openai", "xai")
 
 SYSTEM_PROMPT = (
     "당신은 화자분리(diarization) 결과를 검토하는 보조자입니다. "
@@ -70,7 +70,7 @@ SYSTEM_PROMPT = (
 
 
 def get_provider_candidates() -> list[tuple[str, ResolvedProvider]]:
-    """(슬롯 이름, ResolvedProvider) 후보를 우선순위대로 반환.
+    """(슬롯 이름, ResolvedProvider) 후보를 우선순위대로(FALLBACK_ORDER 순서) 반환.
 
     슬롯 이름은 재시도 횟수/모델 선택 저장 키/로그 표시에 쓰고, ResolvedProvider.id는
     실제 어떤 API 포맷으로 호출할지 판별하는 데 쓴다(gemini_free도 id="gemini"로 호출됨).
@@ -78,18 +78,10 @@ def get_provider_candidates() -> list[tuple[str, ResolvedProvider]]:
     AssemblyAI LLM Gateway는 화자 병합 용도로는 사용하지 않는다(정책 — README 참고).
     """
     candidates: list[tuple[str, ResolvedProvider]] = []
-
-    free_key = get_app_api_key("gemini_free")
-    if free_key:
-        candidates.append(
-            ("gemini_free", ResolvedProvider(id="gemini", model=None, api_key=free_key, base_url=None, key_env="GEMINI_FREE_KEY"))
-        )
-
     for slot in FALLBACK_ORDER:
-        resolved = resolve_provider(slot)
+        resolved = resolve_slot(slot)
         if resolved:
             candidates.append((slot, resolved))
-
     return candidates
 
 

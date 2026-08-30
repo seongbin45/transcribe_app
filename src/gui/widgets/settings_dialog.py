@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from core.config import API_PROVIDERS, AVAILABLE_LANGUAGES, Settings
 from core.secrets import delete_api_key, get_api_key, set_api_key
 from gui.constants import MODEL_CHOICES
+from gui.widgets.llm_model_dialog import LlmModelDialog
 
 
 class SettingsDialog(QDialog):
@@ -98,6 +99,17 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(api_group)
 
+        # --- LLM 모델(화자 병합 제안) ----------------------------------------
+        llm_group = QGroupBox("LLM 모델 (화자 병합 제안)")
+        llm_layout = QVBoxLayout(llm_group)
+        llm_layout.addWidget(
+            QLabel("지정하지 않으면 자동으로 고릅니다. 실시간 목록을 보고 직접 고르려면:")
+        )
+        llm_model_btn = QPushButton("LLM 모델 선택...")
+        llm_model_btn.clicked.connect(self._on_open_llm_model_dialog)
+        llm_layout.addWidget(llm_model_btn)
+        layout.addWidget(llm_group)
+
         # --- 화자분리 기본값 ------------------------------------------------
         self.diarize_default_check = QCheckBox("전사 시작 시 기본적으로 화자분리 포함")
         layout.addWidget(self.diarize_default_check)
@@ -157,6 +169,10 @@ class SettingsDialog(QDialog):
     def _on_delete_key(self) -> None:
         delete_api_key(API_PROVIDERS[0])
         self._refresh_api_status()
+
+    def _on_open_llm_model_dialog(self) -> None:
+        dialog = LlmModelDialog(self)
+        dialog.exec()
 
     def result_settings(self) -> Settings:
         languages = [code for code, cb in self.language_checks.items() if cb.isChecked()]

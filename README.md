@@ -156,7 +156,23 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
   1. **자동 선택 키워드 버그**: 저렴한 모델을 우선 고르려고 `"mini"`를 키워드로 썼는데, "gemini"라는 단어 자체에 `"mini"`가 들어있어서(ge**mini**) 사실상 모든 Gemini 모델이 걸리는 문제 발견 → `"-mini"`처럼 하이픈을 붙여서 수정. 이미지/음성 전용 모델(`-image`, `-tts` 등)도 자동 선택 후보에서 제외하도록 추가
   2. **Gemini "thinking" 토큰이 응답 예산을 다 먹는 문제**: `gemini-2.5-flash`가 내부적으로 생각하는 토큰을 먼저 쓰고 남는 걸로 답을 만드는데, `maxOutputTokens`가 부족해서 JSON 응답이 중간에 잘리는 걸(`Unterminated string` 파싱 오류) 실제로 겪음 → `thinkingConfig.thinkingBudget: 0`으로 비활성화 + `max_tokens`를 700→1500으로 상향해서 해결
 
-**다음 단계(예정)**: 지금은 자동 선택만 있고, 설정 화면에서 사용자가 실시간 목록을 보고 직접 모델/제공자 순서를 고르는 UI는 아직 없음 — "차근차근히" 진행 중이라 이 부분은 다음 단계로 남겨둠.
+### 설정 화면: 실시간 LLM 모델 선택 UI + 화자 수 UI 개선 (2026-08-31)
+
+**요청**: "지금은 자동으로만 고르고 있는 걸, 설정 화면에서 사용자가 실시간 목록을 보고 직접 모델을 고를 수 있게 만드는 UI를 만들어보자." + "메인 화면의 화자 수 선택 UI가 직관적이지 않아. 고쳐줘."
+
+**LLM 모델 선택 UI**: [gui/widgets/llm_model_dialog.py](transcribe_app/src/gui/widgets/llm_model_dialog.py)를 새로 만들어 [설정] → "LLM 모델 선택..." 버튼으로 열림.
+- `.env`에 키가 있는 슬롯(`gemini_free`/`gemini`/`claude`/`openai`/`xai`)만 드롭다운에 표시 (`core/llm_providers.configured_slots()`)
+- "실시간 모델 목록 불러오기"로 `core/llm_catalog.fetch_models()`를 백그라운드 스레드(QThread)에서 호출 — GUI가 멈추지 않음
+- 목록에서 모델을 골라 "선택한 모델로 저장"을 누르면 `core/llm_catalog.select_model()`이 실제 라이브 카탈로그에 있는지 확인 후 `llm_selection.json`에 저장(이것도 스레드에서 실행)
+- "자동 선택으로 초기화"로 언제든 자동 선택 로직으로 되돌릴 수 있음(`clear_selected_model`)
+- 이 작업 중에 `core/llm_providers.py`에 `resolve_slot()`/`SLOT_IDS`/`SLOT_LABELS`/`configured_slots()`를 추가해 `llm_refine.py`와 이 다이얼로그가 "gemini_free는 레지스트리에 없는 이 앱 전용 슬롯" 특수 처리를 중복 구현하지 않도록 정리함. 리팩터링 중 `get_provider_candidates()`가 실수로 `SLOT_IDS`(레지스트리 나열 순서, xai가 gemini보다 먼저 옴)를 폴백 우선순위로 쓸 뻔한 걸 테스트 전에 발견해 명시적 `FALLBACK_ORDER` 상수로 되돌림 — 모델 *선택 UI*의 표시 순서(`SLOT_IDS`)와 실패 시 *폴백 순서*(`FALLBACK_ORDER`)는 서로 다른 목적이라 분리 유지
+- **실제 Gemini 무료 키로 3개 흐름 전부 검증**: 목록 조회(39개 모델 실시간 확인) → 저장(카탈로그 대조 후 `llm_selection.json` 갱신) → 자동 선택으로 초기화, 모두 정상 동작 확인
+
+**화자 수 UI 개선**: [gui/main_window.py](transcribe_app/src/gui/main_window.py)에서 기존에 "화자분리 포함" 체크박스와 최소/최대 화자 수 스핀박스(`0=자동`이라는 텍스트로만 설명)가 한 줄에 뒤섞여 있어 관계가 불명확했음. 개선:
+- "화자분리" `QGroupBox`로 묶고, 그 안에 "화자분리 포함" 체크박스 아래에 "예상 화자 수를 알고 있어요" 체크박스를 별도로 둠(껐을 때는 스핀박스가 비활성화됨 — `0=자동` 같은 암묵적 규칙 대신 체크박스로 명시)
+- 체크하면 "최소 [2명] ~ 최대 [8명]"로 값을 직접 입력 — 화자 수 힌트 기능(위 "화자 수 힌트 기능" 절 참고)이 실제로 긴 녹음에서 정확도를 크게 올린다는 걸 이미 확인했으므로, 툴팁에 그 근거를 그대로 안내
+- 최소 > 최대로 입력하면 전사 시작 전에 경고 후 중단
+- 헤드리스 스모크 테스트로 토글 시 스핀박스 활성/비활성 전환이 올바른지 확인 완료
 
 ### 화자분리 검증 관련 참고
 

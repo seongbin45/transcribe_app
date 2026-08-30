@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -270,6 +271,16 @@ class MainWindow(QMainWindow):
         for label, _value in MODEL_CHOICES:
             self.model_combo.addItem(label)
         stt_row.addWidget(self.model_combo)
+        stt_row.addStretch()
+
+        self.transcribe_btn = QPushButton("전사 시작")
+        self.transcribe_btn.setEnabled(False)
+        self.transcribe_btn.clicked.connect(self._on_transcribe)
+        stt_row.addWidget(self.transcribe_btn)
+        layout.addLayout(stt_row)
+
+        diarize_group = QGroupBox("화자분리")
+        diarize_layout = QVBoxLayout(diarize_group)
 
         self.diarize_check = QCheckBox("화자분리 포함")
         self.diarize_check.setToolTip(
@@ -277,30 +288,37 @@ class MainWindow(QMainWindow):
             "다른 파일을 처리하면 같은 사람이라도 라벨이 다시 매겨질 수 있습니다\n"
             "(목소리로 신원을 식별/매칭하는 기능은 지원하지 않습니다)."
         )
-        stt_row.addWidget(self.diarize_check)
+        diarize_layout.addWidget(self.diarize_check)
 
-        stt_row.addWidget(QLabel("화자 수(대략, 선택):"))
-        self.min_speakers_spin = QSpinBox()
-        self.min_speakers_spin.setRange(0, 50)
-        self.min_speakers_spin.setSpecialValueText("자동")
-        self.min_speakers_spin.setToolTip(
-            "예상 화자 수 범위를 대략이라도 알려주면 정확도가 크게 올라갑니다.\n"
-            "특히 긴 녹음(1시간 이상)에서 화자 수가 실제보다 훨씬 적게 묶이는 걸 방지합니다.\n"
-            "0 = 자동(힌트 없음)"
+        speaker_count_row = QHBoxLayout()
+        self.speaker_count_check = QCheckBox("예상 화자 수를 알고 있어요")
+        self.speaker_count_check.setToolTip(
+            "화자 수를 대략이라도 알려주면 화자분리 정확도가 크게 올라갑니다.\n"
+            "특히 긴 녹음(1시간 이상)에서는 힌트가 없으면 실제보다 화자 수가 훨씬 적게 "
+            "뭉뚱그려지는 경우가 많습니다."
         )
-        stt_row.addWidget(self.min_speakers_spin)
-        stt_row.addWidget(QLabel("~"))
-        self.max_speakers_spin = QSpinBox()
-        self.max_speakers_spin.setRange(0, 50)
-        self.max_speakers_spin.setSpecialValueText("자동")
-        self.max_speakers_spin.setToolTip(self.min_speakers_spin.toolTip())
-        stt_row.addWidget(self.max_speakers_spin)
+        self.speaker_count_check.toggled.connect(self._on_speaker_count_toggled)
+        speaker_count_row.addWidget(self.speaker_count_check)
 
-        self.transcribe_btn = QPushButton("전사 시작")
-        self.transcribe_btn.setEnabled(False)
-        self.transcribe_btn.clicked.connect(self._on_transcribe)
-        stt_row.addWidget(self.transcribe_btn)
-        layout.addLayout(stt_row)
+        speaker_count_row.addWidget(QLabel("최소"))
+        self.min_speakers_spin = QSpinBox()
+        self.min_speakers_spin.setRange(1, 50)
+        self.min_speakers_spin.setValue(2)
+        self.min_speakers_spin.setSuffix("명")
+        speaker_count_row.addWidget(self.min_speakers_spin)
+
+        speaker_count_row.addWidget(QLabel("~ 최대"))
+        self.max_speakers_spin = QSpinBox()
+        self.max_speakers_spin.setRange(1, 50)
+        self.max_speakers_spin.setValue(8)
+        self.max_speakers_spin.setSuffix("명")
+        speaker_count_row.addWidget(self.max_speakers_spin)
+
+        speaker_count_row.addStretch()
+        diarize_layout.addLayout(speaker_count_row)
+        layout.addWidget(diarize_group)
+
+        self._on_speaker_count_toggled(False)
 
         layout.addWidget(QLabel("전사 결과:"))
         self.transcript_box = QTextEdit()
@@ -370,6 +388,10 @@ class MainWindow(QMainWindow):
         self.diarize_check.setEnabled(available)
         self.diarize_check.setChecked(available and s.diarize_default)
         self.diarize_check.setToolTip("" if available else tooltip)
+
+    def _on_speaker_count_toggled(self, checked: bool) -> None:
+        self.min_speakers_spin.setEnabled(checked)
+        self.max_speakers_spin.setEnabled(checked)
 
     def _on_open_settings(self) -> None:
         dialog = SettingsDialog(self._settings, self)
@@ -461,11 +483,14 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("전사 중...")
 
-        min_speakers = self.min_speakers_spin.value() or None
-        max_speakers = self.max_speakers_spin.value() or None
-        if min_speakers and max_speakers and min_speakers > max_speakers:
-            QMessageBox.warning(self, "입력 확인", "최소 화자 수가 최대 화자 수보다 큽니다.")
-            return
+        min_speakers: int | None = None
+        max_speakers: int | None = None
+        if self.speaker_count_check.isChecked():
+            min_speakers = self.min_speakers_spin.value()
+            max_speakers = self.max_speakers_spin.value()
+            if min_speakers > max_speakers:
+                QMessageBox.warning(self, "입력 확인", "최소 화자 수가 최대 화자 수보다 큽니다.")
+                return
 
         self._transcribe_worker = TranscribeWorker(
             self._wav_path,
