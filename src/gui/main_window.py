@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -112,6 +113,8 @@ class TranscribeWorker(QThread):
         multilingual_mode: bool,
         diarize: bool,
         api_key: str | None,
+        min_speakers: int | None = None,
+        max_speakers: int | None = None,
     ):
         super().__init__()
         self.wav_path = wav_path
@@ -121,6 +124,8 @@ class TranscribeWorker(QThread):
         self.multilingual_mode = multilingual_mode
         self.diarize = diarize
         self.api_key = api_key
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
 
     def run(self) -> None:
         try:
@@ -151,7 +156,9 @@ class TranscribeWorker(QThread):
 
         self.status.emit("화자분리 중... (pyannote 모델 로드/실행)")
         dia_engine = LocalPyannoteEngine(hf_token=get_hf_token())
-        speaker_segments = dia_engine.diarize(self.wav_path)
+        speaker_segments = dia_engine.diarize(
+            self.wav_path, min_speakers=self.min_speakers, max_speakers=self.max_speakers
+        )
         merged = assign_speakers(segments, speaker_segments)
         _relabel_speakers(merged)
         self.succeeded.emit(merged)
@@ -161,7 +168,11 @@ class TranscribeWorker(QThread):
         if self.diarize:
             self.status.emit("API로 전사 + 화자분리 처리 중... (AssemblyAI)")
             segments = engine.transcribe_with_diarization(
-                self.wav_path, languages=self.languages, multilingual_mode=self.multilingual_mode
+                self.wav_path,
+                languages=self.languages,
+                multilingual_mode=self.multilingual_mode,
+                min_speakers=self.min_speakers,
+                max_speakers=self.max_speakers,
             )
         else:
             self.status.emit("API로 전사 처리 중... (AssemblyAI)")
@@ -241,7 +252,29 @@ class MainWindow(QMainWindow):
         stt_row.addWidget(self.model_combo)
 
         self.diarize_check = QCheckBox("화자분리 포함")
+        self.diarize_check.setToolTip(
+            "화자 라벨(화자 1, 2...)은 이번 실행 안에서만 의미가 있습니다.\n"
+            "다른 파일을 처리하면 같은 사람이라도 라벨이 다시 매겨질 수 있습니다\n"
+            "(목소리로 신원을 식별/매칭하는 기능은 지원하지 않습니다)."
+        )
         stt_row.addWidget(self.diarize_check)
+
+        stt_row.addWidget(QLabel("화자 수(대략, 선택):"))
+        self.min_speakers_spin = QSpinBox()
+        self.min_speakers_spin.setRange(0, 50)
+        self.min_speakers_spin.setSpecialValueText("자동")
+        self.min_speakers_spin.setToolTip(
+            "예상 화자 수 범위를 대략이라도 알려주면 정확도가 크게 올라갑니다.\n"
+            "특히 긴 녹음(1시간 이상)에서 화자 수가 실제보다 훨씬 적게 묶이는 걸 방지합니다.\n"
+            "0 = 자동(힌트 없음)"
+        )
+        stt_row.addWidget(self.min_speakers_spin)
+        stt_row.addWidget(QLabel("~"))
+        self.max_speakers_spin = QSpinBox()
+        self.max_speakers_spin.setRange(0, 50)
+        self.max_speakers_spin.setSpecialValueText("자동")
+        self.max_speakers_spin.setToolTip(self.min_speakers_spin.toolTip())
+        stt_row.addWidget(self.max_speakers_spin)
 
         self.transcribe_btn = QPushButton("전사 시작")
         self.transcribe_btn.setEnabled(False)
@@ -393,6 +426,12 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("전사 중...")
 
+        min_speakers = self.min_speakers_spin.value() or None
+        max_speakers = self.max_speakers_spin.value() or None
+        if min_speakers and max_speakers and min_speakers > max_speakers:
+            QMessageBox.warning(self, "입력 확인", "최소 화자 수가 최대 화자 수보다 큽니다.")
+            return
+
         self._transcribe_worker = TranscribeWorker(
             self._wav_path,
             engine_mode=s.engine_mode,
@@ -401,6 +440,8 @@ class MainWindow(QMainWindow):
             multilingual_mode=s.multilingual_mode,
             diarize=self.diarize_check.isChecked(),
             api_key=get_api_key(API_PROVIDERS[0]) if s.engine_mode == "api" else None,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
         )
         self._transcribe_worker.succeeded.connect(self._on_transcribe_done)
         self._transcribe_worker.failed.connect(self._on_transcribe_failed)

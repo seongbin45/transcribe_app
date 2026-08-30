@@ -46,8 +46,12 @@ class AssemblyAIEngine(STTEngine):
         wav_path: Path,
         languages: list[str],
         multilingual_mode: bool = False,
+        min_speakers: int | None = None,
+        max_speakers: int | None = None,
     ) -> list[SpeakerTranscriptSegment]:
-        transcript_id = self._submit(wav_path, speaker_labels=True)
+        transcript_id = self._submit(
+            wav_path, speaker_labels=True, min_speakers=min_speakers, max_speakers=max_speakers
+        )
         data = self._poll(transcript_id)
         return self._build_from_utterances(data)
 
@@ -58,7 +62,13 @@ class AssemblyAIEngine(STTEngine):
         resp.raise_for_status()
         return resp.json()["upload_url"]
 
-    def _submit(self, wav_path: Path, speaker_labels: bool) -> str:
+    def _submit(
+        self,
+        wav_path: Path,
+        speaker_labels: bool,
+        min_speakers: int | None = None,
+        max_speakers: int | None = None,
+    ) -> str:
         upload_url = self._upload(wav_path)
         payload = {
             "audio_url": upload_url,
@@ -66,6 +76,17 @@ class AssemblyAIEngine(STTEngine):
             "language_detection": True,
             "speech_models": SPEECH_MODELS,
         }
+        # 화자 수 힌트가 없으면 아주 긴/다양한 오디오에서 실제보다 훨씬 적은 화자 수로
+        # 뭉뚱그려지는 경우가 있어(예: 5시간 녹음이 3명으로만 분류), 대략적인 범위라도 있으면 도움이 됨.
+        if speaker_labels and (min_speakers is not None or max_speakers is not None):
+            payload["speaker_options"] = {
+                k: v
+                for k, v in {
+                    "min_speakers_expected": min_speakers,
+                    "max_speakers_expected": max_speakers,
+                }.items()
+                if v is not None
+            }
         resp = requests.post(
             f"{BASE_URL}/transcript",
             headers={**self._headers, "content-type": "application/json"},
