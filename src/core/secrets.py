@@ -23,6 +23,8 @@ _ENV_VAR_CANDIDATES = {
     "assemblyai": ["ASSEMBLYAI_API_KEY", "ASSEMBLY_AI_API_KEY"],
     "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     "gemini_free": ["GEMINI_FREE_KEY"],
+    "groq": ["GROQ_API_KEY"],
+    "pyannoteai": ["PYANNOTEAI_API_KEY", "PYANNOTE_API_KEY"],
 }
 
 

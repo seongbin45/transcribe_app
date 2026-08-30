@@ -24,7 +24,10 @@ AVAILABLE_LANGUAGES = [
     ("베트남어", "vi"),
 ]
 
-API_PROVIDERS = ["assemblyai"]
+# "groq"는 화자분리를 자체 지원하지 않는 순수 STT라서, 선택하면 화자분리는 항상
+# pyannoteAI(core/engines/pyannoteai_engine.py)와 함께 쓴다(README "10시간 제한/속도
+# 대안 조사" 절 참고). 그래서 이 이름 하나가 "Groq STT + pyannoteAI 화자분리" 조합을 뜻한다.
+API_PROVIDERS = ["assemblyai", "groq"]
 
 
 @dataclass

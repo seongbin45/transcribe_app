@@ -27,11 +27,13 @@ from PySide6.QtWidgets import (
 
 from core.align import SpeakerTranscriptSegment, assign_speakers
 from core.audio_extract import MediaError, MediaInfo, extract_audio, is_supported, probe_media
-from core.config import API_PROVIDERS, DEFAULT_SETTINGS, SUPPORTED_EXTENSIONS, Settings
+from core.config import DEFAULT_SETTINGS, SUPPORTED_EXTENSIONS, Settings
 from core.engines.assemblyai_engine import AssemblyAIEngine
 from core.engines.base import TranscriptSegment
+from core.engines.groq_engine import GroqEngine
 from core.engines.local_pyannote import LocalPyannoteEngine
 from core.engines.local_whisper import LocalWhisperEngine
+from core.engines.pyannoteai_engine import PyannoteAIEngine
 from core.exporters.docx_exporter import export_docx
 from core.exporters.markdown_exporter import export_markdown, export_txt
 from core.exporters.subtitle_exporter import export_srt, export_vtt
@@ -128,6 +130,8 @@ _STAGE_LABELS = {
     "stt": "전사(STT)",
     "diarize": "화자분리",
     "api": "API 처리",
+    "groq_stt": "Groq 전사",
+    "pyannoteai_diarize": "pyannoteAI 화자분리",
 }
 
 
@@ -203,7 +207,8 @@ class TranscribeWorker(QThread):
         languages: list[str],
         multilingual_mode: bool,
         diarize: bool,
-        api_key: str | None,
+        api_provider: str,
+        api_keys: dict[str, str],
         audio_duration_sec: float,
         min_speakers: int | None = None,
         max_speakers: int | None = None,
@@ -215,7 +220,12 @@ class TranscribeWorker(QThread):
         self.languages = languages
         self.multilingual_mode = multilingual_mode
         self.diarize = diarize
-        self.api_key = api_key
+        # api_provider: "assemblyai" | "groq" (후자는 항상 pyannoteAI와 조합해서 화자분리).
+        # api_keys는 provider 이름 -> 키. assemblyai면 {"assemblyai": ...}, groq면
+        # {"groq": ..., "pyannoteai": ...} 둘 다 들어있다(gui/widgets/settings_dialog.py에서
+        # provider별로 따로 입력받은 것을 그대로 넘김).
+        self.api_provider = api_provider
+        self.api_keys = api_keys
         self.audio_duration_sec = audio_duration_sec
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
@@ -281,11 +291,17 @@ class TranscribeWorker(QThread):
         self.succeeded.emit(merged)
 
     def _run_api(self) -> None:
+        if self.api_provider == "groq":
+            self._run_groq_pyannoteai()
+        else:
+            self._run_assemblyai()
+
+    def _run_assemblyai(self) -> None:
         api_pre_estimate = estimate_seconds("api", self.audio_duration_sec)
         self.stage_started.emit("api", api_pre_estimate)
         api_start = time.monotonic()
 
-        engine = AssemblyAIEngine(api_key=self.api_key or "")
+        engine = AssemblyAIEngine(api_key=self.api_keys.get("assemblyai") or "")
         if self.diarize:
             self.status.emit("API로 전사 + 화자분리 처리 중... (AssemblyAI)")
             segments = engine.transcribe_with_diarization(
@@ -302,6 +318,55 @@ class TranscribeWorker(QThread):
             )
         self.stage_done.emit("api", time.monotonic() - api_start)
         self.succeeded.emit(segments)
+
+    def _run_groq_pyannoteai(self) -> None:
+        """Groq(초고속 STT) + pyannoteAI(화자분리)를 조합 — 둘 다 순수 단일 기능이라
+        core.align.assign_speakers()로 직접 정렬해서 합친다(로컬 엔진과 동일한 방식)."""
+        groq_pre_estimate = estimate_seconds("groq_stt", self.audio_duration_sec, self.model_size)
+        self.stage_started.emit("groq_stt", groq_pre_estimate)
+        groq_start = time.monotonic()
+
+        self.status.emit("Groq로 전사 중... (초고속 클라우드 STT)")
+        stt_engine = GroqEngine(api_key=self.api_keys.get("groq") or "")
+
+        def _groq_progress(done: int, total: int) -> None:
+            self.progress.emit(done, total)
+            self.status.emit(f"Groq로 전사 중... ({done}/{total} 조각)")
+
+        segments = stt_engine.transcribe(
+            self.wav_path,
+            languages=self.languages,
+            multilingual_mode=self.multilingual_mode,
+            progress_callback=_groq_progress,
+        )
+        self.stage_done.emit("groq_stt", time.monotonic() - groq_start)
+
+        if not self.diarize:
+            self.succeeded.emit(segments)
+            return
+
+        dia_pre_estimate = estimate_seconds("pyannoteai_diarize", self.audio_duration_sec)
+        self.stage_started.emit("pyannoteai_diarize", dia_pre_estimate)
+        dia_start = time.monotonic()
+
+        self.status.emit("pyannoteAI로 화자분리 중... (클라우드)")
+        dia_engine = PyannoteAIEngine(api_key=self.api_keys.get("pyannoteai") or "")
+
+        def _dia_progress(step_name: str, _done: int, _total: int) -> None:
+            # pyannoteAI는 폴링 응답에 실제 진행률(%)이 없어(상태 문자열만 옴), 진행바를
+            # 억지로 채우지 않고 상태 문구만 갱신한다 — 남은 시간은 별도 ETA 카운트다운이 담당.
+            self.status.emit(f"pyannoteAI 화자분리 중: {step_name}")
+
+        speaker_segments = dia_engine.diarize(
+            self.wav_path,
+            min_speakers=self.min_speakers,
+            max_speakers=self.max_speakers,
+            progress_callback=_dia_progress,
+        )
+        self.stage_done.emit("pyannoteai_diarize", time.monotonic() - dia_start)
+        merged = assign_speakers(segments, speaker_segments)
+        _relabel_speakers(merged)
+        self.succeeded.emit(merged)
 
 
 class MergeSuggestWorker(QThread):
@@ -518,15 +583,23 @@ class MainWindow(QMainWindow):
         else:
             self.transcribe_btn.setText(f"전사 시작 ({'+'.join(s.languages)})")
 
-        engine_desc = "로컬 (faster-whisper + pyannote)" if s.engine_mode == "local" else "API (AssemblyAI)"
+        if s.engine_mode == "local":
+            engine_desc = "로컬 (faster-whisper + pyannote)"
+        elif s.api_provider == "groq":
+            engine_desc = "API (Groq + pyannoteAI, 초고속)"
+        else:
+            engine_desc = "API (AssemblyAI)"
         self.engine_label.setText(f"현재 엔진: {engine_desc}   (설정에서 변경 가능)")
 
         self._refresh_diarize_availability()
 
     def _refresh_diarize_availability(self) -> None:
         s = self._settings
-        if s.engine_mode == "api":
-            available = bool(get_api_key(API_PROVIDERS[0]))
+        if s.engine_mode == "api" and s.api_provider == "groq":
+            available = bool(get_api_key("groq")) and bool(get_api_key("pyannoteai"))
+            tooltip = "Groq/pyannoteAI API 키가 모두 설정되어 있지 않습니다. 설정에서 둘 다 입력해주세요."
+        elif s.engine_mode == "api":
+            available = bool(get_api_key("assemblyai"))
             tooltip = "AssemblyAI API 키가 설정되어 있지 않습니다. 설정에서 입력해주세요."
         else:
             available = bool(get_hf_token())
@@ -717,7 +790,16 @@ class MainWindow(QMainWindow):
             return
         s = self._settings
 
-        if s.engine_mode == "api" and not get_api_key(API_PROVIDERS[0]):
+        if s.engine_mode == "api" and s.api_provider == "groq":
+            if not get_api_key("groq"):
+                QMessageBox.warning(self, "API 키 필요", "설정에서 Groq API 키를 먼저 입력해주세요.")
+                return
+            if self.diarize_check.isChecked() and not get_api_key("pyannoteai"):
+                QMessageBox.warning(
+                    self, "API 키 필요", "화자분리를 사용하려면 설정에서 pyannoteAI API 키도 입력해주세요."
+                )
+                return
+        elif s.engine_mode == "api" and not get_api_key("assemblyai"):
             QMessageBox.warning(self, "API 키 필요", "설정에서 AssemblyAI API 키를 먼저 입력해주세요.")
             return
 
@@ -746,6 +828,13 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("전사 중...")
 
+        if s.engine_mode == "api" and s.api_provider == "groq":
+            api_keys = {"groq": get_api_key("groq") or "", "pyannoteai": get_api_key("pyannoteai") or ""}
+        elif s.engine_mode == "api":
+            api_keys = {"assemblyai": get_api_key("assemblyai") or ""}
+        else:
+            api_keys = {}
+
         self._current_model_size = model_size
         self._transcribe_worker = TranscribeWorker(
             self._wav_path,
@@ -754,7 +843,8 @@ class MainWindow(QMainWindow):
             languages=s.languages,
             multilingual_mode=s.multilingual_mode,
             diarize=self.diarize_check.isChecked(),
-            api_key=get_api_key(API_PROVIDERS[0]) if s.engine_mode == "api" else None,
+            api_provider=s.api_provider,
+            api_keys=api_keys,
             audio_duration_sec=self._media_info.duration_sec if self._media_info else 0.0,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
@@ -778,11 +868,11 @@ class MainWindow(QMainWindow):
         pct = max(0, min(100, int(done / total * 100)))
         self.progress.setValue(pct)
 
-        # STT 단계는 done/total이 뚝뚝 끊기지 않는 단일 카운터(윈도우 처리 수)라 실제
-        # 속도로 예상 시간을 다시 계산할 수 있음. 화자분리 내부 단계는 done/total이
-        # 단계마다 다시 0부터 시작해 신뢰할 수 없어서, 대신 사전 추정치 기반 카운트다운을
-        # 그대로 둔다(_start_eta에서 이미 설정됨).
-        if self._eta_tracker is not None and self._eta_stage == "stt":
+        # STT 단계(로컬 "stt", Groq "groq_stt")는 done/total이 뚝뚝 끊기지 않는 단일
+        # 카운터(윈도우/조각 처리 수)라 실제 속도로 예상 시간을 다시 계산할 수 있음.
+        # 화자분리 내부 단계는 done/total이 단계마다 다시 0부터 시작해 신뢰할 수 없어서,
+        # 대신 사전 추정치 기반 카운트다운을 그대로 둔다(_start_eta에서 이미 설정됨).
+        if self._eta_tracker is not None and self._eta_stage in ("stt", "groq_stt"):
             self._eta_tracker.on_progress(done, total)
             self._update_eta_label()
 

@@ -50,6 +50,13 @@ _DEFAULT_RTF = {
     "diarize": _MEASURED_DIARIZE_RTF,
     "extract": 0.05,  # 오디오만 추출하는 ffmpeg 재인코딩은 보통 실시간보다 훨씬 빠름
     "api": 0.3,  # AssemblyAI 등 클라우드 처리 — 실측 전까지의 대략적 기본값
+    # Groq/pyannoteAI는 로컬(stt/diarize)이나 AssemblyAI(api)와 완전히 다른 성격의
+    # 처리(초고속 GPU 클라우드)라, 같은 RTF 통계에 섞이면 안 돼서 별도 stage 이름을 씀.
+    # 조사 결과(Groq 공식 벤치마크: 실시간의 200배 이상)를 참고하되, 실제 계정/네트워크
+    # 환경에서 검증 전까지는 안전 마진을 크게 둔 보수적인 값만 시드로 사용 — 첫 실행 후
+    # record_actual()이 실측치로 즉시 대체함.
+    "groq_stt": 0.02,  # 시드: 200배 실시간 주장의 1/10만 신뢰(검증 전 보수적 기본값)
+    "pyannoteai_diarize": 0.2,  # 시드: 공식 속도 수치를 못 찾아 로컬 대비 대략 4~5배만 가정
 }
 
 _EMA_ALPHA = 0.3  # 지수이동평균 가중치 — 최근 실행에 더 비중을 두되 과거 값도 반영

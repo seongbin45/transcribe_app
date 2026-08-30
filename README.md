@@ -292,6 +292,30 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
 
 **검증**: 실제 3분 클립으로는 검사를 조용히 통과함(정상 파일에 영향 없음)을 확인. 사용자가 겪은 것과 정확히 같은 길이(10시간 31분 8초)로 시뮬레이션해 `AssemblyAIError`가 "10시간 31분 8초로 그보다 깁니다..." 메시지와 함께 발생하고, `requests.post`가 단 한 번도 호출되지 않는 것(=업로드 자체가 시도되지 않음)을 `transcribe()`/`transcribe_with_diarization()` 양쪽 모두에서 확인.
 
+### 10시간 제한 대안 조사 + Groq/pyannoteAI 엔진 추가 (2026-08-31)
+
+**요청**: "API 10시간 제한을 해결할 수 있는 다른 서비스와 대체 가능한(로컬보다 더 빠른) 방안을 자료조사하라." 이어서 "2번(Rev AI)부터 3번(Groq+pyannoteAI)까지 차근차근히 구현하자."
+
+**조사 결과 요약**: Google STT(8h)/Azure 배치(4h, 화자분리 켜면)/Mistral 배치(3h) 등 주요 클라우드 STT+화자분리 서비스 중 AssemblyAI의 10시간보다 더 넉넉한 곳은 Rev AI(17시간)뿐이었음. 다만 Rev AI를 실제 API 스펙까지 파고들어 확인한 결과, (1) 언어 자동 감지가 전사 요청과 별개인 "Language Identification API"로 분리돼 있어 파일 전체 1회만 판정하고(이 앱의 핵심인 구간별 코드스위칭 재판정 불가), (2) 화자 수 힌트(min/max) 파라미터가 아예 없으며 화자 수 자체가 영어 8명/비영어 6명으로 상한이 있음(이 앱의 실측 데이터 중 8명·11명짜리 녹음이 있어 위험) — 사용자가 이 제약을 확인하고 **Rev AI는 건너뛰기로 결정**, 대신 **Groq(초고속 STT) + pyannoteAI(클라우드 화자분리, 로컬과 같은 개발사)** 조합을 구현.
+
+**구현**:
+- [core/audio_chunk.py](transcribe_app/src/core/audio_chunk.py)(신규): Groq는 요청당 파일 크기 상한(무료 티어 25MB)이 있어, ffmpeg segment muxer로 45분·48kbps mono mp3 조각으로 미리 나눔. **실제 ffmpeg로 검증하다가 발견한 버그**: 원본 길이가 조각 길이의 배수에 안 맞으면(거의 항상) 경계에 1초도 안 되는 사실상 빈 조각이 하나 더 생김(3분 파일을 60초로 나누면 3개가 아니라 4개, 4번째가 0.7KB) — 조각 길이를 `probe_media()`로 재확인해 너무 짧은 조각은 버리도록 수정.
+- [core/engines/groq_engine.py](transcribe_app/src/core/engines/groq_engine.py)(신규): Whisper large-v3-turbo, OpenAI 호환 엔드포인트. 조각별로 전사 후 타임스탬프에 조각 시작 시각을 더해 이어붙임. 언어는 언어가 1개로 고정돼 있을 때만 힌트로 보내고, 다국어 모드거나 2개 이상이면 자동 감지에 맡김(잘못된 단일 언어 강제보다 안전).
+- [core/engines/pyannoteai_engine.py](transcribe_app/src/core/engines/pyannoteai_engine.py)(신규): 업로드(사전 서명 URL 발급 → PUT) → `/v1/diarize`로 잡 생성 → 폴링 → 결과 파싱. 로컬 pyannote와 같은 min/max 화자 수 힌트를 그대로 지원.
+- 설정 화면에 "API - Groq + pyannoteAI" 라디오와 키 입력칸 2개(Groq, pyannoteAI) 추가, `TranscribeWorker`가 제공자별로 분기하되 병합은 로컬 엔진과 똑같이 `core/align.py`의 `assign_speakers()`를 재사용.
+
+**실제 API 호출로 발견한 버그 2개(공식 문서만 보고는 알 수 없었던 것들)**:
+1. **화자 수 힌트에 모델 지정이 필수**: `minSpeakers`/`maxSpeakers`를 보냈더니 `400 Invalid request: "minSpeakers and maxSpeakers are available only when model is 'precision-2'"` — 기본 모델(community-1로 추정)은 화자 수 힌트를 아예 안 받음. `model: "precision-2"`를 항상 명시하도록 수정(마침 정확도도 더 높다고 조사됨: Precision-1 대비 +14%, 로컬 오픈소스 대비 +28%).
+2. **응답 스키마가 조사했던 문서 예시와 다름**: pyannoteAI 문서(`llms-full.txt`)의 예시는 `output`이 세그먼트 리스트를 바로 담고 있었지만, 실제 응답은 `output.diarization`으로 한 겹 더 감싸져 있었음(`output["start"]`를 시도하다 `TypeError: string indices must be integers`로 발견) — 실제 응답을 직접 찍어보고 고침.
+
+**실제 API로 측정한 속도(Day1 3분 클립, `personal_probe.wav`)**:
+- Groq STT: RTF **0.017~0.030** (180초 오디오를 3~5초에 처리) — 로컬(RTF 0.58~1.4 실측대) 대비 대략 **20~80배** 빠름.
+- pyannoteAI 화자분리: RTF **0.19~0.21** (180초를 33~37초에 처리) — 로컬(RTF 0.89 평균) 대비 대략 **4~5배** 빠름.
+- 전체 파이프라인(Groq+pyannoteAI 순차 실행)이 `TranscribeWorker`를 통해 정상적으로 세그먼트를 병합·재라벨링(`화자 1`~`화자 4`)하는 것까지 `MainWindow._on_transcribe()`를 실제로 호출해 확인(threading은 동기 실행으로 대체해 검증) — ETA 표시(`groq_stt`는 진행률 기반 실시간 갱신, `pyannoteai_diarize`는 사전 추정 카운트다운)와 `perf_profile.json` 자기보정 기록까지 전부 실제 값으로 확인.
+- **한계**: 화자분리 자체는 pyannoteAI가 로컬보다 몇 배 빠르지만, 여전히 STT보다 느려서 전체 파이프라인의 병목은 화자분리 쪽. 그래도 10.5시간짜리 파일 기준으로 보면 로컬로 STT+화자분리를 합쳐 6~12시간 걸릴 게, 이 조합으로는 대략 10~20분대로 줄어들 것으로 추정(실측 RTF 기준 추정치, 실제 초장시간 파일로는 아직 검증 안 됨).
+
+**남은 한계(정직하게 기록)**: Groq도 AssemblyAI처럼 단일 요청 언어 힌트가 "청크(45분) 단위"라 로컬의 25초 단위 코드스위칭 재판정만큼 촘촘하지 않음. pyannoteAI 진행 상황은 폴링 응답에 실제 퍼센트가 없어(상태 문자열만) 화자분리 단계의 진행바는 계속 불확정 표시로 두고 ETA 카운트다운만 보여줌.
+
 ### 화자분리 검증 관련 참고
 
 3단계 통합(STT + 화자분리 + 정렬)은 Windows 내장 TTS로 만든 합성 음성으로 파이프라인 자체(에러 없이 동작, 시간/텍스트/화자 라벨이 올바르게 병합되는지)는 확인했습니다. 다만 두 합성 음성(둘 다 여성 목소리)을 pyannote가 같은 화자로 묶는 경우가 있었는데, 이는 합성 음성이 실제 사람 목소리보다 음색 차이가 작고 클립이 짧아서(~20초) 생긴 현상으로 보입니다. **실제 화자분리 정확도는 실제 사람 목소리가 담긴 파일로 직접 확인이 필요**합니다.

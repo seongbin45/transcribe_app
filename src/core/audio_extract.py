@@ -16,9 +16,10 @@ STT_SAMPLE_RATE = 16000
 # QThread(백그라운드 스레드)에서 ffmpeg/ffprobe를 subprocess.run()으로 호출하면
 # Windows에서 자식 프로세스가 콘솔/표준입력을 상속받으려다 멈추는 경우가 있어,
 # 콘솔 창을 만들지 않고 stdin도 완전히 끊어서 실행한다.
-_SUBPROCESS_KWARGS = {"stdin": subprocess.DEVNULL}
+# (공개 이름으로 둠 — core/audio_chunk.py도 같은 ffmpeg 호출 방식을 재사용함)
+SUBPROCESS_KWARGS = {"stdin": subprocess.DEVNULL}
 if os.name == "nt":
-    _SUBPROCESS_KWARGS["creationflags"] = subprocess.CREATE_NO_WINDOW
+    SUBPROCESS_KWARGS["creationflags"] = subprocess.CREATE_NO_WINDOW
 
 
 class MediaError(RuntimeError):
@@ -35,7 +36,7 @@ class MediaInfo:
     codec: str | None
 
 
-def _find_binary(name: str) -> str:
+def find_binary(name: str) -> str:
     path = shutil.which(name)
     if not path:
         raise MediaError(
@@ -55,7 +56,7 @@ def probe_media(path: Path) -> MediaInfo:
     if not is_supported(path):
         raise MediaError(f"지원하지 않는 확장자입니다: {path.suffix}")
 
-    ffprobe = _find_binary("ffprobe")
+    ffprobe = find_binary("ffprobe")
     cmd = [
         ffprobe,
         "-v", "error",
@@ -65,7 +66,7 @@ def probe_media(path: Path) -> MediaInfo:
         str(path),
     ]
     result = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **_SUBPROCESS_KWARGS
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **SUBPROCESS_KWARGS
     )
     if result.returncode != 0:
         raise MediaError(f"ffprobe 실행 실패: {result.stderr.strip()}")
@@ -97,7 +98,7 @@ def extract_audio(path: Path, output_dir: Path, sample_rate: int = STT_SAMPLE_RA
     if not is_supported(path):
         raise MediaError(f"지원하지 않는 확장자입니다: {path.suffix}")
 
-    ffmpeg = _find_binary("ffmpeg")
+    ffmpeg = find_binary("ffmpeg")
     output_dir.mkdir(parents=True, exist_ok=True)
     # 원본 확장자/경로가 달라도 stem이 같으면 같은 출력 파일로 충돌할 수 있어
     # 원본 절대경로 해시를 붙여 구분한다.
@@ -115,7 +116,7 @@ def extract_audio(path: Path, output_dir: Path, sample_rate: int = STT_SAMPLE_RA
         str(out_path),
     ]
     result = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **_SUBPROCESS_KWARGS
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **SUBPROCESS_KWARGS
     )
     if result.returncode != 0:
         raise MediaError(f"오디오 추출 실패: {result.stderr.strip()[-1000:]}")

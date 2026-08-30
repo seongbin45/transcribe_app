@@ -1,4 +1,10 @@
-"""설정 화면: 언어 선택, 로컬/API 엔진 전환, API 키 입력."""
+"""설정 화면: 언어 선택, 로컬/API 엔진 전환, API 키 입력.
+
+API 엔진은 두 가지: AssemblyAI(한 번의 호출로 전사+화자분리, 최대 10시간)와
+Groq + pyannoteAI(Groq가 초고속 STT, pyannoteAI가 화자분리 — 둘을 조합해서 씀,
+core/engines/groq_engine.py・pyannoteai_engine.py 참고). 후자를 고르면 키 입력칸이
+두 개(Groq, pyannoteAI) 나온다.
+"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
@@ -14,9 +20,10 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QVBoxLayout,
+    QWidget,
 )
 
-from core.config import API_PROVIDERS, AVAILABLE_LANGUAGES, Settings
+from core.config import AVAILABLE_LANGUAGES, Settings
 from core.secrets import delete_api_key, get_api_key, set_api_key
 from gui.constants import MODEL_CHOICES
 from gui.widgets.llm_model_dialog import LlmModelDialog
@@ -26,8 +33,10 @@ class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("설정")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
         self._settings = settings
+        self._key_edits: dict[str, QLineEdit] = {}
+        self._key_status_labels: dict[str, QLabel] = {}
         self._build_ui()
         self._load_from_settings(settings)
 
@@ -55,9 +64,20 @@ class SettingsDialog(QDialog):
         engine_layout = QVBoxLayout(engine_group)
 
         self.local_radio = QRadioButton("로컬 (faster-whisper + pyannote, 무료, CPU 사용)")
-        self.api_radio = QRadioButton("API (AssemblyAI, 유료, 화자분리 포함 한 번에 처리)")
+        self.assemblyai_radio = QRadioButton("API - AssemblyAI (유료, 화자분리 포함 한 번에 처리, 최대 10시간)")
+        self.groq_radio = QRadioButton("API - Groq + pyannoteAI (유료, 초고속 클라우드, 실험적)")
+        self.groq_radio.setToolTip(
+            "Groq(초고속 STT) + pyannoteAI(화자분리, 화자 수 힌트 지원)를 조합해서 씁니다.\n"
+            "길이 제한은 요청당 크기(무료 티어 25MB)라서 앱이 자동으로 45분 단위 조각으로\n"
+            "나눠 보냅니다 — 조각 경계에서 문장이 살짝 끊길 수 있습니다.\n"
+            "언어는 조각(45분)마다 자동 감지되며, 로컬 엔진의 25초 단위 재판정만큼\n"
+            "촘촘하지는 않습니다."
+        )
         engine_layout.addWidget(self.local_radio)
-        engine_layout.addWidget(self.api_radio)
+        engine_layout.addWidget(self.assemblyai_radio)
+        engine_layout.addWidget(self.groq_radio)
+        for radio in (self.local_radio, self.assemblyai_radio, self.groq_radio):
+            radio.toggled.connect(self._on_engine_choice_changed)
 
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("로컬 모델 크기:"))
@@ -70,34 +90,15 @@ class SettingsDialog(QDialog):
         layout.addWidget(engine_group)
 
         # --- API 키 -------------------------------------------------------
-        api_group = QGroupBox("AssemblyAI API 키")
-        api_layout = QVBoxLayout(api_group)
+        self.assemblyai_key_group = self._build_key_section("assemblyai", "AssemblyAI")
+        layout.addWidget(self.assemblyai_key_group)
 
-        self.api_status_label = QLabel()
-        api_layout.addWidget(self.api_status_label)
-
-        key_row = QHBoxLayout()
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_edit.setPlaceholderText("새 API 키 입력 (교체할 때만)")
-        key_row.addWidget(self.api_key_edit)
-
-        self.show_key_btn = QPushButton("표시")
-        self.show_key_btn.setCheckable(True)
-        self.show_key_btn.toggled.connect(self._on_toggle_show_key)
-        key_row.addWidget(self.show_key_btn)
-        api_layout.addLayout(key_row)
-
-        key_btn_row = QHBoxLayout()
-        save_key_btn = QPushButton("이 키 저장")
-        save_key_btn.clicked.connect(self._on_save_key)
-        delete_key_btn = QPushButton("저장된 키 삭제")
-        delete_key_btn.clicked.connect(self._on_delete_key)
-        key_btn_row.addWidget(save_key_btn)
-        key_btn_row.addWidget(delete_key_btn)
-        api_layout.addLayout(key_btn_row)
-
-        layout.addWidget(api_group)
+        self.groq_keys_container = QWidget()
+        groq_keys_layout = QVBoxLayout(self.groq_keys_container)
+        groq_keys_layout.setContentsMargins(0, 0, 0, 0)
+        groq_keys_layout.addWidget(self._build_key_section("groq", "Groq"))
+        groq_keys_layout.addWidget(self._build_key_section("pyannoteai", "pyannoteAI"))
+        layout.addWidget(self.groq_keys_container)
 
         # --- LLM 모델(화자 병합 제안) ----------------------------------------
         llm_group = QGroupBox("LLM 모델 (화자 병합 제안)")
@@ -130,16 +131,56 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _build_key_section(self, provider: str, display_name: str) -> QGroupBox:
+        """provider 하나에 대한 "상태 표시 + 키 입력 + 표시/저장/삭제" 묶음을 만든다.
+        AssemblyAI는 이 묶음 하나, Groq+pyannoteAI는 이 묶음을 두 개(provider별로) 쓴다.
+        """
+        group = QGroupBox(f"{display_name} API 키")
+        group_layout = QVBoxLayout(group)
+
+        status_label = QLabel()
+        group_layout.addWidget(status_label)
+
+        key_row = QHBoxLayout()
+        key_edit = QLineEdit()
+        key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        key_edit.setPlaceholderText("새 API 키 입력 (교체할 때만)")
+        key_row.addWidget(key_edit)
+
+        show_btn = QPushButton("표시")
+        show_btn.setCheckable(True)
+        show_btn.toggled.connect(
+            lambda checked, e=key_edit, b=show_btn: self._on_toggle_show_key(checked, e, b)
+        )
+        key_row.addWidget(show_btn)
+        group_layout.addLayout(key_row)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("이 키 저장")
+        save_btn.clicked.connect(lambda _checked=False, p=provider, e=key_edit: self._on_save_key(p, e))
+        delete_btn = QPushButton("저장된 키 삭제")
+        delete_btn.clicked.connect(lambda _checked=False, p=provider: self._on_delete_key(p))
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(delete_btn)
+        group_layout.addLayout(btn_row)
+
+        self._key_edits[provider] = key_edit
+        self._key_status_labels[provider] = status_label
+        return group
+
     def _load_from_settings(self, settings: Settings) -> None:
         self.multilingual_check.setChecked(settings.multilingual_mode)
         for code, cb in self.language_checks.items():
             cb.setChecked(code in settings.languages)
         self._on_multilingual_toggled(settings.multilingual_mode)
 
-        if settings.engine_mode == "api":
-            self.api_radio.setChecked(True)
+        if settings.engine_mode == "api" and settings.api_provider == "groq":
+            self.groq_radio.setChecked(True)
+        elif settings.engine_mode == "api":
+            self.assemblyai_radio.setChecked(True)
         else:
             self.local_radio.setChecked(True)
+        self._on_engine_choice_changed()
 
         for i, (_label, value) in enumerate(MODEL_CHOICES):
             if value == settings.whisper_model_size:
@@ -151,34 +192,34 @@ class SettingsDialog(QDialog):
         self._refresh_api_status()
 
     def _refresh_api_status(self) -> None:
-        provider = API_PROVIDERS[0]
-        has_key = bool(get_api_key(provider))
-        self.api_status_label.setText(
-            "현재 상태: 저장된 키 있음" if has_key else "현재 상태: 저장된 키 없음"
-        )
+        for provider, label in self._key_status_labels.items():
+            has_key = bool(get_api_key(provider))
+            label.setText("현재 상태: 저장된 키 있음" if has_key else "현재 상태: 저장된 키 없음")
+
+    def _on_engine_choice_changed(self, _checked: bool = False) -> None:
+        self.assemblyai_key_group.setVisible(self.assemblyai_radio.isChecked())
+        self.groq_keys_container.setVisible(self.groq_radio.isChecked())
 
     def _on_multilingual_toggled(self, checked: bool) -> None:
         for cb in self.language_checks.values():
             cb.setEnabled(not checked)
 
-    def _on_toggle_show_key(self, checked: bool) -> None:
-        self.api_key_edit.setEchoMode(
-            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
-        )
-        self.show_key_btn.setText("숨기기" if checked else "표시")
+    def _on_toggle_show_key(self, checked: bool, key_edit: QLineEdit, show_btn: QPushButton) -> None:
+        key_edit.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password)
+        show_btn.setText("숨기기" if checked else "표시")
 
-    def _on_save_key(self) -> None:
-        key = self.api_key_edit.text().strip()
+    def _on_save_key(self, provider: str, key_edit: QLineEdit) -> None:
+        key = key_edit.text().strip()
         if not key:
             QMessageBox.warning(self, "입력 필요", "저장할 API 키를 입력해주세요.")
             return
-        set_api_key(API_PROVIDERS[0], key)
-        self.api_key_edit.clear()
+        set_api_key(provider, key)
+        key_edit.clear()
         self._refresh_api_status()
         QMessageBox.information(self, "저장 완료", "API 키를 OS 자격 증명 저장소에 저장했습니다.")
 
-    def _on_delete_key(self) -> None:
-        delete_api_key(API_PROVIDERS[0])
+    def _on_delete_key(self, provider: str) -> None:
+        delete_api_key(provider)
         self._refresh_api_status()
 
     def _on_open_llm_model_dialog(self) -> None:
@@ -192,7 +233,14 @@ class SettingsDialog(QDialog):
 
         self._settings.languages = languages
         self._settings.multilingual_mode = self.multilingual_check.isChecked()
-        self._settings.engine_mode = "api" if self.api_radio.isChecked() else "local"
+        if self.groq_radio.isChecked():
+            self._settings.engine_mode = "api"
+            self._settings.api_provider = "groq"
+        elif self.assemblyai_radio.isChecked():
+            self._settings.engine_mode = "api"
+            self._settings.api_provider = "assemblyai"
+        else:
+            self._settings.engine_mode = "local"
         self._settings.whisper_model_size = MODEL_CHOICES[self.model_combo.currentIndex()][1]
         self._settings.diarize_default = self.diarize_default_check.isChecked()
         self._settings.cross_validate_merges = self.cross_validate_check.isChecked()
