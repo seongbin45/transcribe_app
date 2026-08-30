@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QEasingCurve, QThread, QVariantAnimation, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -294,8 +294,8 @@ class MainWindow(QMainWindow):
         # "지금 뭘 눌러야 하는지" 다음 단계 버튼을 깜빡여서 알려줌(화면 구성 요소가 많아
         # 처음 보면 어디부터 시작할지 헷갈린다는 사용자 피드백 반영). 조건이 아직 안 갖춰졌거나
         # (예: 파일 미선택) 그 단계가 이미 실행됐으면(예: 추출 완료) 깜빡이지 않는다.
-        self._blink_state: dict[str, bool] = {}
-        self._blink_timers: dict[str, QTimer] = {}
+        self._blink_effects: dict[str, QGraphicsDropShadowEffect] = {}
+        self._blink_animations: dict[str, QVariantAnimation] = {}
         self._start_blink("browse", self.browse_btn)  # 시작 시엔 파일이 선택 안 되어 있음
 
         self.progress = QProgressBar()
@@ -469,39 +469,51 @@ class MainWindow(QMainWindow):
             self._set_selected_path(Path(file_path))
 
     def _start_blink(self, key: str, button: QPushButton) -> None:
-        timer = self._blink_timers.get(key)
-        if timer is None:
-            timer = QTimer(self)
-            timer.setInterval(500)
-            timer.timeout.connect(lambda: self._toggle_blink(key, button))
-            self._blink_timers[key] = timer
-        timer.start()
+        """버튼을 입체(키캡) 스타일로 계속 띄워둔 채, 그림자를 사인 곡선처럼 부드럽게
+        부풀렸다 줄이며 "숨쉬는" 느낌으로 눈에 띄게 한다.
+
+        예전엔 500ms마다 평평한 상태 <-> 입체 상태를 QTimer로 뚝뚝 끊어 전환했는데
+        ("깜빡임이 좀 더 부드러웠으면" 하는 피드백을 받음), 대신 버튼은 항상 입체 상태를
+        유지하고 QVariantAnimation(easing=InOutSine, 무한 반복)으로 그림자의 흐림 정도/
+        투명도만 연속적으로 오가게 해서 뚝뚝 끊기지 않는 펄스로 바꿨다.
+        """
+        self._stop_blink(key, button)  # 이미 돌고 있었다면 깨끗이 정리하고 새로 시작
+
+        button.setStyleSheet(_BLINK_RAISED_STYLE)
+        effect = QGraphicsDropShadowEffect(button)
+        effect.setOffset(0, 5)
+        effect.setColor(QColor(191, 54, 12, 90))
+        effect.setBlurRadius(10)
+        button.setGraphicsEffect(effect)
+
+        anim = QVariantAnimation(self)
+        anim.setDuration(900)
+        anim.setStartValue(0.0)
+        anim.setKeyValueAt(0.5, 1.0)
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+        anim.setLoopCount(-1)
+        anim.valueChanged.connect(lambda v, eff=effect: self._apply_blink_frame(eff, v))
+        anim.start()
+
+        self._blink_effects[key] = effect
+        self._blink_animations[key] = anim
 
     def _stop_blink(self, key: str, button: QPushButton) -> None:
-        timer = self._blink_timers.get(key)
-        if timer is not None:
-            timer.stop()
-        self._blink_state[key] = False
+        anim = self._blink_animations.pop(key, None)
+        if anim is not None:
+            anim.stop()
+        self._blink_effects.pop(key, None)
         button.setStyleSheet("")
-        button.setGraphicsEffect(None)  # 이전 틱에서 붙였을 수 있는 그림자 제거
+        button.setGraphicsEffect(None)  # 붙어 있던 그림자 이펙트 제거(평평한 기본 버튼으로 복귀)
 
-    def _toggle_blink(self, key: str, button: QPushButton) -> None:
-        """버튼을 반투명 그림자(QGraphicsDropShadowEffect)와 입체(키캡) 스타일로 튀어나오게
-        했다가, 평평한 원래 상태로 되돌리기를 반복 — 단순 색상 점멸보다 "눌러야 할 것"임을
-        더 뚜렷하게 전달하기 위함. QSS는 box-shadow를 지원하지 않아 그림자는 별도 이펙트로 적용.
-        """
-        on = not self._blink_state.get(key, False)
-        self._blink_state[key] = on
-        if on:
-            button.setStyleSheet(_BLINK_RAISED_STYLE)
-            shadow = QGraphicsDropShadowEffect(button)
-            shadow.setBlurRadius(20)
-            shadow.setOffset(0, 5)
-            shadow.setColor(QColor(0, 0, 0, 150))
-            button.setGraphicsEffect(shadow)
-        else:
-            button.setStyleSheet("")
-            button.setGraphicsEffect(None)
+    @staticmethod
+    def _apply_blink_frame(effect: QGraphicsDropShadowEffect, phase: float) -> None:
+        """phase(0~1, 사인 곡선처럼 부드럽게 오감)에 맞춰 그림자를 숨쉬듯 부풀렸다 줄인다."""
+        effect.setBlurRadius(10 + phase * 22)  # 10~32
+        color = effect.color()
+        color.setAlpha(int(90 + phase * 150))  # 90~240
+        effect.setColor(color)
 
     def _set_selected_path(self, path: Path) -> None:
         if not is_supported(path):
