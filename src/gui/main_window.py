@@ -186,7 +186,7 @@ class TranscribeWorker(QThread):
 
 
 class MergeSuggestWorker(QThread):
-    succeeded = Signal(dict, str, str)  # merges, reasoning, provider_used
+    succeeded = Signal(list, str, str)  # list[MergeCandidate], reasoning, provider_used
     failed = Signal(str)
     status = Signal(str)
 
@@ -545,12 +545,12 @@ class MainWindow(QMainWindow):
         self._merge_worker.status.connect(self.statusBar().showMessage)
         self._merge_worker.start()
 
-    def _on_merge_suggest_done(self, merges: dict, reasoning: str, provider: str) -> None:
+    def _on_merge_suggest_done(self, candidates: list, reasoning: str, provider: str) -> None:
         self.progress.setVisible(False)
         self.merge_suggest_btn.setEnabled(True)
         self.statusBar().showMessage(f"화자 병합 제안 도착 (사용된 제공자: {provider})")
 
-        dialog = MergeReviewDialog(self._last_segments, merges, reasoning, self)
+        dialog = MergeReviewDialog(candidates, reasoning, self)
         if dialog.exec() == MergeReviewDialog.DialogCode.Accepted:
             approved = dialog.approved_merges()
             if approved:

@@ -18,13 +18,27 @@ core/llm_providers.py로 이식):
   4. openai (OPENAI_API_KEY)
   5. xai (XAI_API_KEY)
 모델 id는 하드코딩하지 않고 core/llm_catalog.py가 실시간으로 조회+검증해서 고른다.
+
+증거 기반 검증(evidence grounding, 2026-08-31 추가): LLM에게 "확신도 90%"처럼 스스로
+말하게 하는 것만으로는 부족하다는 걸 문헌 조사로 확인했다 — LLM-as-judge는 구조적으로
+과신(overconfident)하는 경향이 있고(예: arxiv.org/abs/2508.06225), self-reported confidence는
+실제 정확도와 잘 맞지 않는다. 대신 검증 가능한 신호를 요구하는 게 더 신뢰할 수 있다는 게
+grounded citation/span-level verification 계열 연구(예: arxiv.org/abs/2408.04568)의 결론이라,
+이제 각 병합 제안마다 "원문에서 그대로 복사한 인용문"을 화자별로 요구하고, 그 인용문이 실제
+원문(세그먼트 텍스트)에 있는지 프로그램이 문자열 대조로 검증한다(`_verify_quote`). 인용문이
+원문에서 확인되지 않으면 — 즉 LLM이 근거 자체를 지어냈다는 뜻이므로 — 그 병합 제안은 사람에게
+보여주지도 않고 자동 폐기한다. 검증된 인용문은 리뷰 다이얼로그에 그대로 노출해서, 사람이 봐도
+"그럴듯해서" 그냥 승인해버리는 automation bias를 줄인다(리뷰 화면에 실제 근거를 보여주는 것 자체가
+"cognitive forcing function"이라는 human-in-the-loop 연구 결과 반영).
 """
 from __future__ import annotations
 
 import json
 import logging
 import random
+import re
 import time
+from dataclasses import dataclass
 
 import requests
 
@@ -34,6 +48,39 @@ from .llm_catalog import clear_selected_model, ensure_selected_model
 from .llm_providers import ResolvedProvider, resolve_slot
 
 logger = logging.getLogger(__name__)
+
+MIN_QUOTE_LEN = 4  # 너무 짧은 인용문은 아무 문장에나 우연히 걸릴 수 있어 증거로 인정하지 않음
+
+RULE_DESCRIPTIONS = {
+    1: "자기소개/호명 일치",
+    2: "문장이 끊겼다가 이어짐",
+}
+
+
+@dataclass(frozen=True)
+class MergeCandidate:
+    """LLM이 제안하고, 인용문이 원문에서 실제로 확인된 병합 후보 하나."""
+
+    src: str
+    dst: str
+    rule: int | None
+    quote_src: str
+    quote_dst: str
+
+    def rule_description(self) -> str:
+        return RULE_DESCRIPTIONS.get(self.rule, f"규칙 {self.rule}" if self.rule else "근거 불명")
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _verify_quote(quote: str, normalized_source: str) -> bool:
+    """quote가 (공백 차이를 무시하고) 실제로 원문에 존재하는 부분 문자열인지 확인."""
+    q = (quote or "").strip()
+    if len(q) < MIN_QUOTE_LEN:
+        return False
+    return _normalize_for_match(q) in normalized_source
 
 MAX_TRANSCRIPT_CHARS = 60000  # 매우 긴 녹음은 앞부분만 보고 병합 판단 (한계는 README에 명시)
 
@@ -62,10 +109,18 @@ SYSTEM_PROMPT = (
     "역할/주제/말투가 다르면(예: 한쪽은 등록 안내, 다른 쪽은 기술 이야기) 절대 같은 사람으로 "
     "보지 마세요. 확신이 90% 미만이면 병합하지 마세요. 병합을 놓치는 것이 서로 다른 사람을 "
     "합치는 것보다 훨씬 낫습니다. 입력에 나온 화자 라벨만 사용하고, 새로운 라벨을 만들어내지 마세요.\n\n"
-    '먼저 "reasoning" 필드에 후보들을 간단히 검토한 근거를 한두 문장으로 쓰고, 그다음 "merges"에 '
-    "최종 결정만 담아 JSON으로 출력하세요. 다른 텍스트는 출력하지 마세요. 형식: "
-    '{"reasoning": "...", "merges": {"화자 F": "화자 A"}} '
-    "(화자 F를 화자 A로 병합). 병합할 게 없으면 {\"reasoning\": \"...\", \"merges\": {}}."
+    "**각 병합 제안마다 반드시 증거를 제시하세요**: quote_src는 'from' 화자의 발화에서, "
+    "quote_dst는 'to' 화자의 발화에서, 판단 근거가 되는 부분을 한 구절씩 **입력에 나온 텍스트 "
+    "그대로** 복사해서 적으세요. 절대로 요약하거나 의역하거나 새로 만들어내지 마세요 — "
+    "이 인용문은 프로그램이 원문과 문자열 대조로 검증하며, 원문에 실제로 없는 인용문이 확인되면 "
+    "그 병합 제안 전체가 자동으로 폐기됩니다.\n\n"
+    '다음 JSON 형식으로만 출력하세요(다른 텍스트는 출력하지 마세요): '
+    '{"reasoning": "전체 판단을 요약한 한두 문장", "merges": ['
+    '{"from": "화자 F", "to": "화자 A", "rule": 1, '
+    '"quote_src": "화자 F 발화에서 그대로 복사한 인용문", '
+    '"quote_dst": "화자 A 발화에서 그대로 복사한 인용문"}'
+    ']} (화자 F를 화자 A로 병합, rule은 위 기준 1 또는 2 중 해당하는 번호). '
+    '병합할 게 없으면 {"reasoning": "...", "merges": []}.'
 )
 
 
@@ -144,25 +199,78 @@ def _call_with_retry(
     raise last_exc  # pragma: no cover — 루프가 항상 return/raise로 빠짐
 
 
+def _verify_and_filter_merges(
+    raw_merges: object,
+    segments: list[SpeakerTranscriptSegment],
+    slot: str,
+) -> list[MergeCandidate]:
+    """LLM이 내놓은 원시 merges를 검증해 실제로 원문 근거가 확인된 것만 남긴다.
+
+    라벨 자체(입력에 없는 화자 라벨을 지어내는 것)뿐 아니라, 이제 인용문까지 원문과
+    문자열 대조로 검증한다 — 인용문이 지어낸 것이면 판단 근거 자체가 환각일 가능성이
+    높다고 보고 그 병합 제안 전체를 폐기한다(사람에게 보여주지도 않음).
+    """
+    if not isinstance(raw_merges, list):
+        if raw_merges:
+            logger.warning("[%s] merges가 예상한 리스트 형식이 아니라 전부 무시합니다: %r", slot, raw_merges)
+        return []
+
+    valid_labels = {seg.speaker for seg in segments}
+    normalized_blobs = {
+        label: _normalize_for_match("".join(seg.text for seg in segments if seg.speaker == label))
+        for label in valid_labels
+    }
+
+    result: list[MergeCandidate] = []
+    for item in raw_merges:
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("from") or "").strip()
+        dst = str(item.get("to") or "").strip()
+        quote_src = str(item.get("quote_src") or "").strip()
+        quote_dst = str(item.get("quote_dst") or "").strip()
+        rule = item.get("rule")
+
+        if src not in valid_labels or dst not in valid_labels or src == dst:
+            logger.info("[%s] 유효하지 않은 화자 라벨의 병합 제안 폐기: %s -> %s", slot, src, dst)
+            continue
+
+        if not _verify_quote(quote_src, normalized_blobs[src]) or not _verify_quote(
+            quote_dst, normalized_blobs[dst]
+        ):
+            logger.warning(
+                "[%s] 원문에서 확인되지 않는 인용문 — 환각 의심으로 병합 제안 폐기: "
+                "%s -> %s (quote_src=%r, quote_dst=%r)",
+                slot, src, dst, quote_src, quote_dst,
+            )
+            continue
+
+        result.append(MergeCandidate(src=src, dst=dst, rule=rule, quote_src=quote_src, quote_dst=quote_dst))
+
+    return result
+
+
 def suggest_merges(
     segments: list[SpeakerTranscriptSegment],
     status_callback=None,
-) -> tuple[dict[str, str], str, str]:
+) -> tuple[list[MergeCandidate], str, str]:
     """LLM에게 화자 병합을 '제안'만 받아온다 (적용하지 않음).
 
     무료 Gemini 키 -> 일반 Gemini -> Claude -> OpenAI -> xAI 순으로 시도하고,
     (.env에 키가 없는 제공자는 건너뜀) 각 단계는 실패하면 다음으로 롤백한다.
     검증 결과 이 기능은 자동 적용하지 않고 사람이 검토 후 선택 적용하는 것을
     전제로 한다 (LLM이 가끔 존재하지 않는 화자 라벨을 지어내는 것을 확인했기 때문).
+    이제 각 제안은 원문에서 실제로 확인된 인용문(quote_src/quote_dst)이 있어야만
+    후보로 남는다 — `_verify_and_filter_merges` 참고.
 
-    반환: (merges 딕셔너리, LLM이 남긴 판단 근거 텍스트, 실제 사용된 슬롯 이름)
+    반환: (검증된 MergeCandidate 리스트, LLM이 남긴 판단 근거 텍스트, 실제 사용된 슬롯 이름)
     """
     if not segments:
-        return {}, "", ""
+        return [], "", ""
 
-    candidates = get_provider_candidates()
-    if not candidates:
-        return {}, "", ""
+    provider_candidates = get_provider_candidates()
+    if not provider_candidates:
+        return [], "", ""
 
     lines = []
     total = 0
@@ -175,7 +283,7 @@ def suggest_merges(
     user_content = "\n".join(lines)
 
     errors: list[str] = []
-    for slot, resolved in candidates:
+    for slot, resolved in provider_candidates:
         max_attempts = RETRY_ATTEMPTS.get(slot, DEFAULT_RETRY_ATTEMPTS)
         try:
             if status_callback:
@@ -191,18 +299,10 @@ def suggest_merges(
             continue
 
         parsed = json.loads(_strip_code_fence(content))
-        merges = parsed.get("merges") or {}
         reasoning = parsed.get("reasoning") or ""
+        merges = _verify_and_filter_merges(parsed.get("merges"), segments, slot)
 
-        # 존재하지 않는(입력에 없던) 화자 라벨을 지어내는 경우가 있어, 실제 라벨만 유효하게 취급.
-        valid_labels = {seg.speaker for seg in segments}
-        merges = {
-            src: dst
-            for src, dst in merges.items()
-            if src in valid_labels and dst in valid_labels and src != dst
-        }
-
-        logger.info("[%s] LLM 화자 병합 제안: %s (근거: %s)", slot, merges, reasoning)
+        logger.info("[%s] LLM 화자 병합 제안(증거 검증 후 %d건): %s (근거: %s)", slot, len(merges), merges, reasoning)
         return merges, reasoning, slot
 
     raise RuntimeError("모든 LLM 제공자 호출 실패: " + " / ".join(errors))
@@ -210,11 +310,12 @@ def suggest_merges(
 
 def apply_merges(
     segments: list[SpeakerTranscriptSegment],
-    merges: dict[str, str],
+    candidates: list[MergeCandidate],
 ) -> list[SpeakerTranscriptSegment]:
-    """사용자가 승인한 병합 매핑만 실제로 적용."""
-    if not merges:
+    """사용자가 승인한 병합 후보만 실제로 적용."""
+    if not candidates:
         return segments
+    merges = {c.src: c.dst for c in candidates}
     return [
         SpeakerTranscriptSegment(
             start=seg.start,

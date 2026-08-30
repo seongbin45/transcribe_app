@@ -2,6 +2,11 @@
 
 LLM(특히 이 앱에서 실제로 접근 가능한 소형 모델)이 가끔 명백히 틀린 병합을 제안하는 것을
 검증으로 확인했기 때문에, 어떤 제안도 자동 적용하지 않고 항목별로 승인/거부를 받는다.
+
+여기 표시되는 인용문(quote_src/quote_dst)은 core/llm_refine.py가 원문과 문자열 대조로
+이미 검증한 것만 남긴 것이다(원문에 없는 인용문이 확인되면 그 제안은 여기 도달하기 전에
+자동 폐기됨). 그래도 최종 판단은 사람이 직접 근거를 읽고 승인 여부를 정하도록 한다 —
+"그럴듯해 보이면 그냥 승인"하는 automation bias를 줄이기 위해 실제 근거를 보여준다.
 """
 from __future__ import annotations
 
@@ -15,34 +20,30 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
-def _sample_text(segments, speaker: str, max_len: int = 60) -> str:
-    for seg in segments:
-        if seg.speaker == speaker and seg.text.strip():
-            text = seg.text.strip()
-            return text if len(text) <= max_len else text[: max_len - 1] + "…"
-    return "(발화 없음)"
+from core.llm_refine import MergeCandidate
 
 
 class MergeReviewDialog(QDialog):
-    def __init__(self, segments, merges: dict[str, str], reasoning: str, parent=None):
+    def __init__(self, candidates: list[MergeCandidate], reasoning: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("화자 병합 제안 검토 (LLM)")
         self.setMinimumSize(560, 420)
-        self._checks: dict[tuple[str, str], QCheckBox] = {}
+        self._candidates = candidates
+        self._checks: dict[int, QCheckBox] = {}
 
         layout = QVBoxLayout(self)
 
         warn = QLabel(
             "LLM이 문맥을 보고 제안한 병합 목록입니다. 자동으로 적용되지 않으며,\n"
             "체크한 항목만 '적용' 버튼을 눌러야 실제로 반영됩니다.\n"
-            "제안이 잘못된 경우가 있을 수 있으니 아래 발화 예시를 보고 판단해주세요."
+            "아래 인용문은 프로그램이 원문에 실제로 있는지 대조 확인한 것입니다(확인되지 않은 "
+            "인용문이 있던 제안은 이미 자동으로 제외되었습니다). 그래도 근거를 직접 읽고 판단해주세요."
         )
         warn.setWordWrap(True)
         layout.addWidget(warn)
 
         if reasoning:
-            reasoning_label = QLabel(f"LLM 판단 근거: {reasoning}")
+            reasoning_label = QLabel(f"LLM 판단 근거(전체 요약): {reasoning}")
             reasoning_label.setWordWrap(True)
             reasoning_label.setStyleSheet("color: gray;")
             layout.addWidget(reasoning_label)
@@ -52,23 +53,23 @@ class MergeReviewDialog(QDialog):
         container = QWidget()
         container_layout = QVBoxLayout(container)
 
-        if not merges:
+        if not candidates:
             container_layout.addWidget(QLabel("제안된 병합이 없습니다."))
         else:
-            for src, dst in merges.items():
-                cb = QCheckBox(f"{src}  →  {dst} 로 병합")
+            for i, c in enumerate(candidates):
+                cb = QCheckBox(f"{c.src}  →  {c.dst} 로 병합  (근거 유형: {c.rule_description()})")
                 cb.setChecked(False)
                 container_layout.addWidget(cb)
 
                 sample = QLabel(
-                    f"    {src} 예시: \"{_sample_text(segments, src)}\"\n"
-                    f"    {dst} 예시: \"{_sample_text(segments, dst)}\""
+                    f"    {c.src} 인용(원문 확인됨): \"{c.quote_src}\"\n"
+                    f"    {c.dst} 인용(원문 확인됨): \"{c.quote_dst}\""
                 )
                 sample.setStyleSheet("color: gray;")
                 sample.setWordWrap(True)
                 container_layout.addWidget(sample)
 
-                self._checks[(src, dst)] = cb
+                self._checks[i] = cb
 
         container_layout.addStretch()
         scroll.setWidget(container)
@@ -81,5 +82,5 @@ class MergeReviewDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def approved_merges(self) -> dict[str, str]:
-        return {src: dst for (src, dst), cb in self._checks.items() if cb.isChecked()}
+    def approved_merges(self) -> list[MergeCandidate]:
+        return [self._candidates[i] for i, cb in self._checks.items() if cb.isChecked()]

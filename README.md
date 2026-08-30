@@ -174,6 +174,25 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
 - 최소 > 최대로 입력하면 전사 시작 전에 경고 후 중단
 - 헤드리스 스모크 테스트로 토글 시 스핀박스 활성/비활성 전환이 올바른지 확인 완료
 
+### 화자 병합 제안: 증거 기반(evidence-grounded) 검증 추가 (2026-08-31)
+
+**요청**: "AI에게 권한을 넘겨주거나 모든 것을 의지하지 않게, 환각 방지를 위해 다른 사람들이 AI 환각 교차검증 문제를 어떻게 해결했는지 논문/에세이를 찾아 반영하자."
+
+**리서치 방법**: 개별 논문 1000편을 일일이 나열하는 건 비현실적이고 신뢰할 수 없는 결과물(가짜 인용)로 이어지기 쉬워서, 대신 각각 수백 편(예: 300+ 편을 6개 범주로 분류한 MDPI 서베이)을 이미 종합한 **서베이 논문들 + 실무 에세이**를 폭넓게 검색해 이 앱의 실제 유스케이스(좁은 도메인의 구조화된 JSON 출력, 자유 서술 생성 아님)에 맞는 기법만 추렸다.
+
+**핵심 발견 및 반영**:
+- **LLM-as-judge는 구조적으로 과신(overconfident)한다** — self-reported confidence("90% 확신")는 실제 정확도와 잘 맞지 않는다는 연구 다수(예: [Overconfidence in LLM-as-a-Judge](https://arxiv.org/html/2508.06225v2)). 기존 프롬프트가 "확신 90% 미만이면 병합 금지"라고 시켰지만, 이건 모델이 "90%"라고 스스로 말하는 것 자체를 신뢰하는 셈이라 근본적 한계가 있음.
+- **증거 기반 접근(evidence/citation grounding)이 더 신뢰할 수 있다** — 답변이 원문의 특정 구간(span)에 매여 있으면 검증·탈락이 기계적으로 가능하다는 게 grounded-citation 계열 연구의 결론(예: [Learning Fine-Grained Grounded Citations](https://arxiv.org/pdf/2408.04568)). → **각 병합 제안마다 "원문에서 그대로 복사한 인용문"을 화자별로 요구**하도록 [core/llm_refine.py](transcribe_app/src/core/llm_refine.py)의 `SYSTEM_PROMPT`를 변경.
+- **제약된 출력(constrained output)은 그 자체로 환각의 한 유형을 원천 차단한다** — 이미 있던 "유효 화자 라벨만 허용" 필터를 넘어, 이제 **인용문도 원문과 문자열 대조로 검증**(`_verify_quote`/`_verify_and_filter_merges`)해서, 인용문 자체가 지어낸 것으로 확인되면(=판단 근거가 환각) 그 병합 제안 전체를 사람에게 보여주지도 않고 자동 폐기한다.
+- **Human-in-the-loop는 그 자체로 충분하지 않다** — automation bias 연구([Nature Scientific Reports](https://www.nature.com/articles/s41598-026-34983-y) 등)에 따르면 사람도 "그럴듯해 보이면" 별 검토 없이 승인해버리는 경향이 있고, 이를 줄이려면 실제 근거를 눈에 보이게 제시하는 "cognitive forcing function"이 필요하다는 게 중론. → [gui/widgets/merge_review_dialog.py](transcribe_app/src/gui/widgets/merge_review_dialog.py)가 이제 임의의 "화자별 첫 발화 예시"(기존 `_sample_text`, 실제 판단 근거와 무관할 수 있었음) 대신 **원문 검증을 통과한 실제 근거 인용문**을 보여줌.
+- **entity/coreference 병합 결정은 precision-over-recall이 정설** — 기존 설계(병합 누락이 오병합보다 낫다)가 문헌으로 재확인됨. 변경 없음, 그대로 유지.
+
+**구현 변경 사항**:
+- `merges` JSON 스키마를 `{"화자 F": "화자 A"}` 딕셔너리에서 `[{"from": ..., "to": ..., "rule": 1|2, "quote_src": "...", "quote_dst": "..."}]` 리스트로 변경 — `rule`은 기존 병합 기준 1(자기소개/호명)·2(문장 끊김) 중 어느 것에 해당하는지 명시하게 해서 판단을 더 구체적으로 강제함(mini chain-of-verification 성격).
+- `suggest_merges()`가 이제 `dict[str, str]` 대신 검증된 `MergeCandidate` 객체 리스트를 반환 — `apply_merges()`, `MergeReviewDialog`, `gui/main_window.py`의 `MergeSuggestWorker` 시그널까지 전부 이 타입으로 정리.
+- **실제 Gemini 무료 키로 Day1 15분 전체 데이터(203개 세그먼트) 재검증**: 새 스키마로 실제 응답을 받아 2건의 병합 제안이 나왔고, 둘 다 인용문이 원문과 정확히 일치함을 확인 — 특히 "화자 6: '맞아요 채팅을 보낸 게' → 화자 1: '툴입니다 라고'"는 실제로 한 문장이 화자분리 경계에서 끊긴 진짜 사례였음(`output/validation/day1/personal_15min_result.txt` 200~201행에서 직접 대조 확인).
+- 단위 테스트로 정상/인용문 조작(환각)/존재하지 않는 라벨/너무 짧은 인용문/형식 오류/공백 차이 6가지 케이스를 모두 확인.
+
 ### 화자분리 검증 관련 참고
 
 3단계 통합(STT + 화자분리 + 정렬)은 Windows 내장 TTS로 만든 합성 음성으로 파이프라인 자체(에러 없이 동작, 시간/텍스트/화자 라벨이 올바르게 병합되는지)는 확인했습니다. 다만 두 합성 음성(둘 다 여성 목소리)을 pyannote가 같은 화자로 묶는 경우가 있었는데, 이는 합성 음성이 실제 사람 목소리보다 음색 차이가 작고 클립이 짧아서(~20초) 생긴 현상으로 보입니다. **실제 화자분리 정확도는 실제 사람 목소리가 담긴 파일로 직접 확인이 필요**합니다.
