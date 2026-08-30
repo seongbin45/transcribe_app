@@ -534,6 +534,7 @@ class MainWindow(QMainWindow):
             return
         self._stop_blink("browse", self.browse_btn)
         self._stop_blink("transcribe", self.transcribe_btn)  # 새 파일을 고르면 이전 추출 결과는 무효
+        self._stop_blink("export", self.export_btn)  # 이전 전사 결과도 함께 무효
         self._selected_path = path
         self._wav_path = None
         self.path_edit.setText(str(path))
@@ -648,6 +649,11 @@ class MainWindow(QMainWindow):
         self.extract_btn.setEnabled(True)
         self._last_segments = segments
         self.export_btn.setEnabled(bool(segments))
+        if segments:
+            # 전사가 끝났고 아직 저장을 안 했으니, 다음 할 일인 '파일로 저장' 버튼을 깜빡임
+            self._start_blink("export", self.export_btn)
+        else:
+            self._stop_blink("export", self.export_btn)
         has_speakers = bool(segments) and hasattr(segments[0], "speaker")
         self.merge_suggest_btn.setEnabled(has_speakers and bool(get_provider_candidates()))
         self.transcript_box.setPlainText(_format_transcript(segments))
@@ -707,12 +713,15 @@ class MainWindow(QMainWindow):
     def _on_export(self) -> None:
         if not self._last_segments:
             return
+        self._stop_blink("export", self.export_btn)  # 저장을 시도하니 일단 멈춤
+
         label, fmt, file_filter = EXPORT_FORMATS[self.export_format_combo.currentIndex()]
         default_name = (self._selected_path.stem if self._selected_path else "transcript") + f".{fmt}"
         default_dir = str(DEFAULT_SETTINGS.output_dir / default_name)
 
         save_path, _ = QFileDialog.getSaveFileName(self, f"{label}로 저장", default_dir, file_filter)
         if not save_path:
+            self._start_blink("export", self.export_btn)  # 취소했으니 아직 저장 안 된 상태 그대로 재개
             return
 
         title = self._selected_path.stem if self._selected_path else "전사 결과"
@@ -729,6 +738,7 @@ class MainWindow(QMainWindow):
                 export_vtt(self._last_segments, save_path)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "저장 오류", f"파일 저장 중 오류가 발생했습니다: {e}")
+            self._start_blink("export", self.export_btn)  # 실패했으니 다시 눌러야 함을 알리기 위해 재개
             return
 
         self.statusBar().showMessage(f"저장 완료: {save_path}")
