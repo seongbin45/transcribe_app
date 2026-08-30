@@ -57,6 +57,13 @@ _DEFAULT_RTF = {
     # record_actual()이 실측치로 즉시 대체함.
     "groq_stt": 0.02,  # 시드: 200배 실시간 주장의 1/10만 신뢰(검증 전 보수적 기본값)
     "pyannoteai_diarize": 0.2,  # 시드: 공식 속도 수치를 못 찾아 로컬 대비 대략 4~5배만 가정
+    # 로컬 GPU(NVIDIA CUDA) 가속(2026-08-31 추가) — core/gpu_detect.py가 이 기기에서 실제로
+    # CUDA를 쓸 수 있다고 판정했을 때만 쓰이는 stage. CPU("stt"/"diarize")와 완전히 다른
+    # 속도라 같은 통계에 섞이면 예상 시간이 크게 틀어지므로 별도 stage로 분리.
+    # 이 프로젝트 개발 기기에는 NVIDIA GPU가 없어 아직 실측하지 못했음 — 시드는 클라우드
+    # GPU(pyannoteAI, 위 pyannoteai_diarize 실측치)와 비슷한 자릿수로 보수적으로 잡았고,
+    # 실제 GPU 사용자가 한 번이라도 실행하면 그 즉시 실측치로 대체된다.
+    "diarize_gpu": 0.15,
 }
 
 _EMA_ALPHA = 0.3  # 지수이동평균 가중치 — 최근 실행에 더 비중을 두되 과거 값도 반영
@@ -65,6 +72,16 @@ _EMA_ALPHA = 0.3  # 지수이동평균 가중치 — 최근 실행에 더 비중
 def _default_stt_rtf(model_size: str) -> float:
     ratio = _MODEL_SIZE_RELATIVE_SPEED.get(model_size, 1.0)
     return _MEASURED_LARGE_V3_STT_RTF * ratio
+
+
+# 로컬 GPU STT("stt_gpu")의 모델 크기별 기본 배율 — CPU 시드(_MEASURED_LARGE_V3_STT_RTF)에
+# 그대로 곱하기엔 GPU가 훨씬 빠르므로, 대략적인 가속 배율(보수적으로 1/15)만 곱한 값을
+# 시드로 쓴다. 이 기기엔 NVIDIA GPU가 없어 실측 전이라 정밀하지 않음 — 실행 후 자동 보정.
+_GPU_SPEEDUP_GUESS = 1 / 15
+
+
+def _default_stt_gpu_rtf(model_size: str) -> float:
+    return _default_stt_rtf(model_size) * _GPU_SPEEDUP_GUESS
 
 
 def _profile_key(stage: str, model_size: str | None) -> str:
@@ -97,6 +114,8 @@ def get_rtf(stage: str, model_size: str | None = None) -> float:
 
     if stage == "stt":
         return _default_stt_rtf(model_size or "large-v3")
+    if stage == "stt_gpu":
+        return _default_stt_gpu_rtf(model_size or "large-v3")
     return _DEFAULT_RTF.get(stage, 1.0)
 
 

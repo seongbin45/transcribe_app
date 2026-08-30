@@ -329,6 +329,25 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
 
 **검증**: 헤드리스 테스트로 카테고리 3개를 모두 돌아다니거나 엔진 라디오 3개를 모두 바꿔도 `dlg.size()`가 절대 변하지 않는 것을 확인. 5가지 상태(언어/로컬/AssemblyAI/Groq/고급) 전부 스크린샷으로 직접 찍어 어떤 상태에서도 버튼이나 입력칸이 창 밖으로 잘리지 않는 것을 눈으로 확인.
 
+### 로컬 GPU(NVIDIA CUDA) 자동 감지 + 가속 (2026-08-31)
+
+**요청**: "로컬에서 GPU를 돌릴 수 있는 사용자도 있지 않는가? ... GPU 로컬 전용(NVIDIA 상위 모델. 현재 사용가능한 모델을 넘어서 앞으로 출시될 모델까지도 판별)으로 로직을 만들어서. 해당 사용자에게는 옵션이 CPU 대신 GPU로 안내되도록 하자. (실제 동작도 GPU)."
+
+**설계 원칙**: "상위 모델" 판별을 GPU 이름 목록(화이트리스트)으로 만들면 이 요청의 후반부("앞으로 출시될 모델까지도 판별")를 원천적으로 만족시킬 수 없다 — 아직 이름조차 없는 미래 GPU를 코드에 미리 적어둘 방법이 없기 때문. 그래서 [core/gpu_detect.py](transcribe_app/src/core/gpu_detect.py)는 이름이 아니라 **실제 능력을 직접 측정**한다:
+1. **하드웨어 존재 확인**(표시용): PowerShell `Get-CimInstance Win32_VideoController`로 그래픽 어댑터 이름을 조회. **실측으로 발견한 문제**: 이 프로젝트 개발 기기(Intel Arc GPU, 카드 자체 이름표엔 "8GB")를 대상으로 WMI의 `AdapterRAM` 필드를 읽어보니 2GB로 잘못 보고됨 — 4GB 넘는 최신 카드의 VRAM을 WMI가 정확히 못 읽는다는 잘 알려진 문제를 직접 확인. 그래서 VRAM 용량 판정에는 이 필드를 아예 쓰지 않음.
+2. **실제 런타임 능력 확인**(진짜 판정 기준): `torch.cuda.is_available()` + `ctranslate2.get_cuda_device_count()`로 "지금 설치된 PyTorch/ctranslate2가 실제로 CUDA를 쓸 수 있는지"를 직접 확인하고, 되면 torch가 드라이버에서 직접 읽은 VRAM(WMI보다 신뢰할 수 있음)이 최소 6GB(large-v3 GPU 추론에 필요한 대략적인 실무 기준) 이상인지 확인. **이 방식은 새 NVIDIA GPU가 나와도 코드 변경이 전혀 필요 없다** — 모델 이름을 몰라도 CUDA + 충분한 VRAM만 있으면 자동으로 통과.
+
+**하드웨어는 있는데 소프트웨어가 없는 경우도 정직하게 구분**: 이 프로젝트의 `requirements.txt`는 torch/torchaudio를 CPU 전용 빌드로 고정해뒀다(다른 버전 호환성 문제 때문 — 위 "패키지 버전 관련 참고" 절 참고). 그래서 NVIDIA GPU가 있어도 CUDA 지원 빌드를 따로 설치하지 않으면 조용히 CPU로 내려가는 대신, "NVIDIA GPU가 감지됐지만 CUDA 지원 PyTorch/ctranslate2가 설치되어 있지 않습니다"라고 정확히 알려주고 [requirements-gpu.txt](transcribe_app/requirements-gpu.txt)(신규, torch/torchaudio만 CUDA 빌드로 바꾼 버전)를 안내한다. **주의**: 이 프로젝트를 개발한 기기엔 NVIDIA GPU가 없어(아래 실측 참고) `requirements-gpu.txt` 자체는 실제 GPU 환경에서 검증하지 못했다 — CUDA 인덱스 URL은 사용 중인 드라이버 버전에 맞게 조정이 필요할 수 있음을 파일 안에 명시해둠.
+
+**실제 동작 연결**: 판정 결과(`qualifies_for_gpu_mode`)가 참이면 [core/engines/local_whisper.py](transcribe_app/src/core/engines/local_whisper.py)에 `device="cuda"`(+ ctranslate2가 실제로 지원하는 compute type을 직접 물어봐서 float16 우선 선택)를, [core/engines/local_pyannote.py](transcribe_app/src/core/engines/local_pyannote.py)엔 `Pipeline.to(torch.device("cuda"))`를 실제로 넘겨서 진짜로 GPU에서 돈다("실제 동작도 GPU" 요청 대응). CPU/GPU는 속도가 완전히 달라 같은 통계에 섞이면 예상 시간이 틀어지므로, `perf_profile.py`의 실행 시간 자기보정 stage도 `stt`/`diarize`(CPU)와 `stt_gpu`/`diarize_gpu`(GPU)로 분리.
+
+**검증**:
+- 실측: 이 개발 기기(Intel Arc GPU)에서 `probe_gpu_capability()`를 실제로 돌려 "NVIDIA GPU가 감지되지 않았습니다(현재: Intel(R) Arc(TM) 130V GPU (8GB)) — 로컬은 CPU만 제공합니다"로 정확히 판정되는 것을 확인.
+- 모의 테스트(이 기기엔 실제 NVIDIA GPU가 없어 8가지 시나리오를 모의로 검증): 어댑터 정보 없음/비-NVIDIA GPU/NVIDIA는 있지만 CUDA 런타임 없음/VRAM 부족/VRAM 문턱값 정확히 경계/여러 GPU 혼재(내장+외장), 그리고 **가상의 미래 GPU 이름**(`"NVIDIA GeForce RTX 9090 Ti (fictional future model)"`)까지 CUDA+충분한 VRAM 조건만 맞으면 이름과 무관하게 통과하는 것을 확인해 "이름 목록에 의존하지 않는다"는 설계를 실제로 증명.
+- 실제 로컬 STT+화자분리 파이프라인을 `MainWindow._on_transcribe()` 전체 경로로 다시 돌려, GPU가 없는 이 기기에서는 여전히 `stt`/`diarize`(CPU) stage 이름 그대로 정상 동작하고(`stt_gpu`/`diarize_gpu`로 잘못 전환되지 않음) `perf_profile.json`에도 기존과 동일한 키로 기록되는 것을 확인 — 회귀 없음.
+- 설정 화면/메인 화면 모두 실제(CPU만 감지) 상태와 모의(GPU 감지됨) 상태 둘 다 라디오 라벨·엔진 표시·툴팁이 올바르게 바뀌는 것을 확인("로컬 (무료, CPU)" ↔ "로컬 (무료, GPU 가속)").
+- 부수적으로 `systeminfo`가 이 한국어 Windows 기기에서 UTF-8이 아니라 콘솔 OEM 코드페이지(cp949)로 출력하는 것을 실제로 겪어(총 물리 메모리 등 진단 정보 표시용으로만 사용, GPU 판정에는 영향 없음) cp949 우선 디코딩으로 수정.
+
 ### 화자분리 검증 관련 참고
 
 3단계 통합(STT + 화자분리 + 정렬)은 Windows 내장 TTS로 만든 합성 음성으로 파이프라인 자체(에러 없이 동작, 시간/텍스트/화자 라벨이 올바르게 병합되는지)는 확인했습니다. 다만 두 합성 음성(둘 다 여성 목소리)을 pyannote가 같은 화자로 묶는 경우가 있었는데, 이는 합성 음성이 실제 사람 목소리보다 음색 차이가 작고 클립이 짧아서(~20초) 생긴 현상으로 보입니다. **실제 화자분리 정확도는 실제 사람 목소리가 담긴 파일로 직접 확인이 필요**합니다.

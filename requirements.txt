@@ -1,4 +1,7 @@
-# torch/torchaudio를 CPU 전용 휠로 받기 위한 추가 인덱스 (NVIDIA CUDA가 아닌 GPU 환경 포함)
+# torch/torchaudio를 CPU 전용 휠로 받기 위한 추가 인덱스 (NVIDIA CUDA가 아닌 GPU 환경 포함).
+# NVIDIA GPU가 있고 GPU 가속을 쓰고 싶다면 이 파일 대신 requirements-gpu.txt로 설치할 것
+# (core/gpu_detect.py가 실제로 CUDA를 쓸 수 있는지 확인한 뒤에만 GPU 모드를 켜므로, GPU가
+# 없거나 이 CPU 전용 설치를 그대로 써도 앱은 정상 동작한다 — 그냥 GPU 모드를 못 쓸 뿐).
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # === 1단계: GUI 스캐폴드 ===

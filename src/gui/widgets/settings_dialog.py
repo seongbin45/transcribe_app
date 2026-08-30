@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.config import AVAILABLE_LANGUAGES, Settings
+from core.gpu_detect import get_cached_capability
 from core.secrets import delete_api_key, get_api_key, set_api_key
 from gui.constants import MODEL_CHOICES
 from gui.widgets.llm_model_dialog import LlmModelDialog
@@ -119,8 +120,18 @@ class SettingsDialog(QDialog):
         # 원래 라벨에 줄바꿈을 넣어봤다가 라디오버튼이 자동으로 줄바꿈하지 않고 가장 긴
         # 줄 기준으로 폭을 요구해서 오른쪽 API 키 패널이 창 밖으로 잘리는 걸 실제
         # 스크린샷으로 확인하고(STT 엔진 그룹 sizeHint가 528px까지 벌어짐) 이렇게 고침.
-        self.local_radio = QRadioButton("로컬 (무료, CPU)")
-        self.local_radio.setToolTip("faster-whisper + pyannote로 이 컴퓨터에서 처리합니다. 무료지만 CPU만 써서 느립니다.")
+        # GPU 가속(2026-08-31 추가): core/gpu_detect.py가 이 기기에서 NVIDIA GPU를 실제로
+        # 쓸 수 있다고 판정하면 라디오 라벨/툴팁이 "CPU" 대신 "GPU 가속"으로 안내된다 —
+        # 이름 목록으로 특정 GPU 모델을 골라내는 게 아니라 실제 CUDA 사용 가능 여부 +
+        # VRAM 용량을 직접 측정한 결과라, 아직 나오지 않은 미래 GPU도 자동으로 통과한다.
+        gpu_capability = get_cached_capability()
+        if gpu_capability.qualifies_for_gpu_mode:
+            self.local_radio = QRadioButton("로컬 (무료, GPU 가속)")
+        else:
+            self.local_radio = QRadioButton("로컬 (무료, CPU)")
+        self.local_radio.setToolTip(
+            "faster-whisper + pyannote로 이 컴퓨터에서 처리합니다.\n" + gpu_capability.status_message
+        )
         self.assemblyai_radio = QRadioButton("API - AssemblyAI")
         self.assemblyai_radio.setToolTip(
             "유료. 전사+화자분리를 한 번의 호출로 처리합니다. 최대 10시간 길이 제한이 있습니다."

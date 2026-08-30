@@ -37,6 +37,7 @@ from core.engines.pyannoteai_engine import PyannoteAIEngine
 from core.exporters.docx_exporter import export_docx
 from core.exporters.markdown_exporter import export_markdown, export_txt
 from core.exporters.subtitle_exporter import export_srt, export_vtt
+from core.gpu_detect import get_cached_capability, resolve_stt_device_and_compute_type
 from core.llm_refine import apply_merges, get_provider_candidates, suggest_merges
 from core.perf_profile import estimate_seconds, record_actual
 from core.secrets import get_api_key, get_hf_token
@@ -132,6 +133,8 @@ _STAGE_LABELS = {
     "api": "API 처리",
     "groq_stt": "Groq 전사",
     "pyannoteai_diarize": "pyannoteAI 화자분리",
+    "stt_gpu": "전사(STT, GPU)",
+    "diarize_gpu": "화자분리(GPU)",
 }
 
 
@@ -240,15 +243,25 @@ class TranscribeWorker(QThread):
             self.failed.emit(f"전사 중 오류: {e}")
 
     def _run_local(self) -> None:
-        stt_pre_estimate = estimate_seconds("stt", self.audio_duration_sec, self.model_size)
-        self.stage_started.emit("stt", stt_pre_estimate)
+        # GPU 가속(2026-08-31 추가): core/gpu_detect.py가 이 기기에서 NVIDIA GPU를 실제로
+        # 쓸 수 있다고 판정했을 때만 device="cuda"가 됨 — 판정 못 받으면 기존과 동일하게
+        # CPU(int8)로 동작해 회귀가 없다.
+        gpu_capability = get_cached_capability()
+        device, compute_type = resolve_stt_device_and_compute_type(gpu_capability)
+        # CPU/GPU는 속도가 완전히 달라서 perf_profile 통계가 섞이면 예상 시간이 크게
+        # 틀어지므로, stage 이름 자체를 나눈다(core/perf_profile.py 참고).
+        stt_stage = "stt_gpu" if device == "cuda" else "stt"
+        dia_stage = "diarize_gpu" if device == "cuda" else "diarize"
+
+        stt_pre_estimate = estimate_seconds(stt_stage, self.audio_duration_sec, self.model_size)
+        self.stage_started.emit(stt_stage, stt_pre_estimate)
         stt_start = time.monotonic()
 
-        self.status.emit("전사 중... (STT 모델 로드/실행)")
+        self.status.emit(f"전사 중... (STT 모델 로드/실행, {device.upper()})")
         stt_engine = LocalWhisperEngine(
             model_size=self.model_size,
-            device="cpu",
-            compute_type="int8",
+            device=device,
+            compute_type=compute_type,
             download_root=DEFAULT_SETTINGS.models_dir,
         )
 
@@ -262,18 +275,18 @@ class TranscribeWorker(QThread):
             multilingual_mode=self.multilingual_mode,
             progress_callback=_stt_progress,
         )
-        self.stage_done.emit("stt", time.monotonic() - stt_start)
+        self.stage_done.emit(stt_stage, time.monotonic() - stt_start)
 
         if not self.diarize:
             self.succeeded.emit(segments)
             return
 
-        dia_pre_estimate = estimate_seconds("diarize", self.audio_duration_sec)
-        self.stage_started.emit("diarize", dia_pre_estimate)
+        dia_pre_estimate = estimate_seconds(dia_stage, self.audio_duration_sec)
+        self.stage_started.emit(dia_stage, dia_pre_estimate)
         dia_start = time.monotonic()
 
-        self.status.emit("화자분리 중... (pyannote 모델 로드/실행)")
-        dia_engine = LocalPyannoteEngine(hf_token=get_hf_token())
+        self.status.emit(f"화자분리 중... (pyannote 모델 로드/실행, {device.upper()})")
+        dia_engine = LocalPyannoteEngine(hf_token=get_hf_token(), device=device)
 
         def _dia_progress(step_name: str, done: int, total: int) -> None:
             self.progress.emit(done, total)
@@ -285,7 +298,7 @@ class TranscribeWorker(QThread):
             max_speakers=self.max_speakers,
             progress_callback=_dia_progress,
         )
-        self.stage_done.emit("diarize", time.monotonic() - dia_start)
+        self.stage_done.emit(dia_stage, time.monotonic() - dia_start)
         merged = assign_speakers(segments, speaker_segments)
         _relabel_speakers(merged)
         self.succeeded.emit(merged)
@@ -584,12 +597,17 @@ class MainWindow(QMainWindow):
             self.transcribe_btn.setText(f"전사 시작 ({'+'.join(s.languages)})")
 
         if s.engine_mode == "local":
-            engine_desc = "로컬 (faster-whisper + pyannote)"
+            gpu_capability = get_cached_capability()
+            if gpu_capability.qualifies_for_gpu_mode:
+                engine_desc = f"로컬 (faster-whisper + pyannote, GPU 가속 — {', '.join(gpu_capability.gpu_names)})"
+            else:
+                engine_desc = "로컬 (faster-whisper + pyannote, CPU)"
         elif s.api_provider == "groq":
             engine_desc = "API (Groq + pyannoteAI, 초고속)"
         else:
             engine_desc = "API (AssemblyAI)"
         self.engine_label.setText(f"현재 엔진: {engine_desc}   (설정에서 변경 가능)")
+        self.engine_label.setToolTip(get_cached_capability().status_message)
 
         self._refresh_diarize_availability()
 
@@ -868,11 +886,12 @@ class MainWindow(QMainWindow):
         pct = max(0, min(100, int(done / total * 100)))
         self.progress.setValue(pct)
 
-        # STT 단계(로컬 "stt", Groq "groq_stt")는 done/total이 뚝뚝 끊기지 않는 단일
-        # 카운터(윈도우/조각 처리 수)라 실제 속도로 예상 시간을 다시 계산할 수 있음.
-        # 화자분리 내부 단계는 done/total이 단계마다 다시 0부터 시작해 신뢰할 수 없어서,
-        # 대신 사전 추정치 기반 카운트다운을 그대로 둔다(_start_eta에서 이미 설정됨).
-        if self._eta_tracker is not None and self._eta_stage in ("stt", "groq_stt"):
+        # STT 단계(로컬 CPU/GPU "stt"/"stt_gpu", Groq "groq_stt")는 done/total이 뚝뚝
+        # 끊기지 않는 단일 카운터(윈도우/조각 처리 수)라 실제 속도로 예상 시간을 다시
+        # 계산할 수 있음. 화자분리 내부 단계는 done/total이 단계마다 다시 0부터 시작해
+        # 신뢰할 수 없어서, 대신 사전 추정치 기반 카운트다운을 그대로 둔다(_start_eta에서
+        # 이미 설정됨) — GPU 화자분리("diarize_gpu")도 로컬 pyannote 구조를 그대로 쓰므로 동일.
+        if self._eta_tracker is not None and self._eta_stage in ("stt", "stt_gpu", "groq_stt"):
             self._eta_tracker.on_progress(done, total)
             self._update_eta_label()
 
@@ -881,7 +900,7 @@ class MainWindow(QMainWindow):
 
     def _on_stage_done(self, stage: str, elapsed_sec: float) -> None:
         if self._media_info is not None:
-            model_size = self._current_model_size if stage == "stt" else None
+            model_size = self._current_model_size if stage in ("stt", "stt_gpu") else None
             record_actual(stage, self._media_info.duration_sec, elapsed_sec, model_size=model_size)
 
     def _on_transcribe_done(self, segments: list[TranscriptSegment]) -> None:

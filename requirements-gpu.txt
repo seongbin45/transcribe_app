@@ -1,0 +1,39 @@
+# NVIDIA GPU(CUDA) 가속을 쓰려는 사용자용 설치 파일.
+#
+# requirements.txt와 거의 같지만, torch/torchaudio를 CPU 전용 대신 CUDA 지원 빌드로 설치한다
+# — 그 외 버전(torch/torchaudio 2.5.1, huggingface_hub 0.25.2, pyannote.audio 3.3.2)은
+# requirements.txt와 동일하게 맞췄다(왜 이 버전들로 고정했는지는 requirements.txt 상단 주석 참고
+# — pyannote.audio 4.x/최신 torchaudio/torch 2.6+/huggingface_hub 1.x와 얽힌 호환성 문제들).
+#
+# 사용법: requirements.txt 대신 이 파일로 설치.
+#   pip install -r requirements-gpu.txt
+#
+# 주의(중요): faster-whisper(ctranslate2)와 화자분리(pyannote.audio/torch) 모두 GPU를 쓰려면
+# CUDA 지원 빌드가 필요하지만, 이 프로젝트를 개발한 기기에는 NVIDIA GPU가 없어서(core/gpu_detect.py
+# README 참고) 이 파일 자체는 실제 GPU 환경에서 검증하지 못했다. 아래 CUDA 12.1(cu121) 인덱스는
+# 2026-08 시점 torch 2.5.1과 맞는 조합이지만, 사용 중인 NVIDIA 드라이버/CUDA 버전에 따라 다른
+# 인덱스가 필요할 수 있다 — 설치 전에 PyTorch 공식 "Get Started" 페이지
+# (https://pytorch.org/get-started/previous-versions/#v251)에서 자신의 CUDA 버전에 맞는
+# 인덱스 URL을 확인해서 아래 URL을 바꿔주기 바란다.
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# === 1단계: GUI 스캐폴드 ===
+PySide6>=6.7
+
+# === 2단계: 로컬 STT ===
+# faster-whisper(ctranslate2)는 PyPI 기본 배포판에 CUDA 지원이 이미 포함되어 있어(torch와
+# 달리 별도 인덱스가 필요 없음) 실행 시점에 core/gpu_detect.py가 CUDA 사용 가능 여부를 감지한다.
+faster-whisper>=1.2
+
+# === 3단계: 화자분리 (버전 고정 이유는 requirements.txt 참고) ===
+torch==2.5.1
+torchaudio==2.5.1
+huggingface_hub==0.25.2
+pyannote.audio==3.3.2
+python-dotenv>=1.0
+
+# === 4단계: 문서 출력 ===
+python-docx>=1.1
+
+# === 5단계: 설정/API 키 저장 ===
+keyring>=25.0

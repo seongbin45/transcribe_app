@@ -2,12 +2,17 @@
 
 pyannote/speaker-diarization-3.1, pyannote/segmentation-3.0 두 모델 모두
 Hugging Face에서 라이선스 동의가 되어 있어야 하고, Read 권한 토큰이 필요하다.
+
+GPU 가속(2026-08-31 추가): core/gpu_detect.py가 이 기기에서 NVIDIA GPU를 실제로
+쓸 수 있다고 판정하면 device="cuda"로 넘어온다 — pyannote.audio의 Pipeline은
+.to(torch.device)로 모델을 GPU로 옮기는 걸 지원한다.
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable
 
+import torch
 from pyannote.audio import Pipeline
 
 from .diarization_base import DiarizationEngine, SpeakerSegment
@@ -16,12 +21,14 @@ DEFAULT_MODEL = "pyannote/speaker-diarization-3.1"
 
 
 class LocalPyannoteEngine(DiarizationEngine):
-    def __init__(self, hf_token: str, model: str = DEFAULT_MODEL):
+    def __init__(self, hf_token: str, model: str = DEFAULT_MODEL, device: str = "cpu"):
         if not hf_token:
             raise ValueError(
                 "Hugging Face 액세스 토큰이 필요합니다. transcribe_app/.env 의 HF_TOKEN 값을 확인해주세요."
             )
         self.pipeline = Pipeline.from_pretrained(model, use_auth_token=hf_token)
+        if device != "cpu":
+            self.pipeline.to(torch.device(device))
 
     def diarize(
         self,
