@@ -1,9 +1,10 @@
 """파일을 선택 -> 오디오 추출 -> STT(로컬 faster-whisper 또는 API) + 화자분리로 전사, 문서로 내보내는 GUI."""
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QEasingCurve, QThread, QVariantAnimation, Signal
+from PySide6.QtCore import Qt, QEasingCurve, QThread, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -35,6 +36,7 @@ from core.exporters.docx_exporter import export_docx
 from core.exporters.markdown_exporter import export_markdown, export_txt
 from core.exporters.subtitle_exporter import export_srt, export_vtt
 from core.llm_refine import apply_merges, get_provider_candidates, suggest_merges
+from core.perf_profile import estimate_seconds, record_actual
 from core.secrets import get_api_key, get_hf_token
 from core.settings_store import load_settings, save_settings
 from gui.constants import EXPORT_FORMATS, MODEL_CHOICES
@@ -75,6 +77,58 @@ def _format_duration(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _format_duration_kr(seconds: float) -> str:
+    """예상 시간 표시용 — "1시간 5분", "3분 12초", "45초"처럼 사람이 읽기 편한 형식."""
+    total = max(0, int(round(seconds)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}시간 {m}분"
+    if m:
+        return f"{m}분 {s}초"
+    return f"{s}초"
+
+
+class _EtaTracker:
+    """진행 중인 한 단계(추출/STT/화자분리/API)의 예상 남은 시간을 추적한다.
+
+    실행 전 예상치(perf_profile.estimate_seconds)로 시작해서, 실제 진행률 신호가
+    오면(그 신호가 뚝뚝 끊기지 않는 단일 카운터일 때만, on_progress 참고) 지금까지
+    실제로 걸린 속도로 전체 예상 시간을 다시 계산 — "실행 중 실시간으로 변동을
+    감지해서 예상 시간을 갱신"하는 요청에 대응. 매초 갱신되는 표시는 이 트래커의
+    elapsed()/remaining()을 그대로 읽으면 된다.
+    """
+
+    def __init__(self, pre_estimate_sec: float):
+        self._start = time.monotonic()
+        self.estimated_total_sec = pre_estimate_sec
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start
+
+    def on_progress(self, done: int, total: int) -> None:
+        """뚝뚝 끊기지 않는 단일 카운터(예: STT 윈도우 처리 수)에만 사용.
+
+        화자분리 내부 단계처럼 done/total이 단계마다 다시 0부터 시작하는 경우 이걸
+        호출하면 안 됨 — 대신 사전 예상치 기반 카운트다운을 그대로 쓴다.
+        """
+        if total > 0 and done > 0:
+            fraction = min(1.0, done / total)
+            elapsed = self.elapsed()
+            self.estimated_total_sec = max(elapsed / fraction, elapsed)
+
+    def remaining(self) -> float:
+        return max(0.0, self.estimated_total_sec - self.elapsed())
+
+
+_STAGE_LABELS = {
+    "extract": "오디오 추출",
+    "stt": "전사(STT)",
+    "diarize": "화자분리",
+    "api": "API 처리",
+}
 
 
 def _format_info(info: MediaInfo) -> str:
@@ -138,6 +192,8 @@ class TranscribeWorker(QThread):
     failed = Signal(str)
     status = Signal(str)
     progress = Signal(int, int)  # (완료, 전체) — 로컬 엔진의 STT/화자분리 단계에서만 실제 값 전달
+    stage_started = Signal(str, float)  # (stage: "stt"|"diarize"|"api", 실행 전 예상 시간(초))
+    stage_done = Signal(str, float)  # (stage, 실제 걸린 시간(초)) — perf_profile 자기보정용
 
     def __init__(
         self,
@@ -148,6 +204,7 @@ class TranscribeWorker(QThread):
         multilingual_mode: bool,
         diarize: bool,
         api_key: str | None,
+        audio_duration_sec: float,
         min_speakers: int | None = None,
         max_speakers: int | None = None,
     ):
@@ -159,6 +216,7 @@ class TranscribeWorker(QThread):
         self.multilingual_mode = multilingual_mode
         self.diarize = diarize
         self.api_key = api_key
+        self.audio_duration_sec = audio_duration_sec
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
 
@@ -172,6 +230,10 @@ class TranscribeWorker(QThread):
             self.failed.emit(f"전사 중 오류: {e}")
 
     def _run_local(self) -> None:
+        stt_pre_estimate = estimate_seconds("stt", self.audio_duration_sec, self.model_size)
+        self.stage_started.emit("stt", stt_pre_estimate)
+        stt_start = time.monotonic()
+
         self.status.emit("전사 중... (STT 모델 로드/실행)")
         stt_engine = LocalWhisperEngine(
             model_size=self.model_size,
@@ -190,10 +252,15 @@ class TranscribeWorker(QThread):
             multilingual_mode=self.multilingual_mode,
             progress_callback=_stt_progress,
         )
+        self.stage_done.emit("stt", time.monotonic() - stt_start)
 
         if not self.diarize:
             self.succeeded.emit(segments)
             return
+
+        dia_pre_estimate = estimate_seconds("diarize", self.audio_duration_sec)
+        self.stage_started.emit("diarize", dia_pre_estimate)
+        dia_start = time.monotonic()
 
         self.status.emit("화자분리 중... (pyannote 모델 로드/실행)")
         dia_engine = LocalPyannoteEngine(hf_token=get_hf_token())
@@ -208,11 +275,16 @@ class TranscribeWorker(QThread):
             max_speakers=self.max_speakers,
             progress_callback=_dia_progress,
         )
+        self.stage_done.emit("diarize", time.monotonic() - dia_start)
         merged = assign_speakers(segments, speaker_segments)
         _relabel_speakers(merged)
         self.succeeded.emit(merged)
 
     def _run_api(self) -> None:
+        api_pre_estimate = estimate_seconds("api", self.audio_duration_sec)
+        self.stage_started.emit("api", api_pre_estimate)
+        api_start = time.monotonic()
+
         engine = AssemblyAIEngine(api_key=self.api_key or "")
         if self.diarize:
             self.status.emit("API로 전사 + 화자분리 처리 중... (AssemblyAI)")
@@ -228,6 +300,7 @@ class TranscribeWorker(QThread):
             segments = engine.transcribe(
                 self.wav_path, languages=self.languages, multilingual_mode=self.multilingual_mode
             )
+        self.stage_done.emit("api", time.monotonic() - api_start)
         self.succeeded.emit(segments)
 
 
@@ -261,10 +334,19 @@ class MainWindow(QMainWindow):
         self._settings: Settings = load_settings()
         self._selected_path: Path | None = None
         self._wav_path: Path | None = None
+        self._media_info: MediaInfo | None = None
+        self._current_model_size: str | None = None
         self._worker: ExtractWorker | None = None
         self._transcribe_worker: TranscribeWorker | None = None
         self._merge_worker: MergeSuggestWorker | None = None
         self._last_segments: list[TranscriptSegment] | list[SpeakerTranscriptSegment] = []
+
+        # 실행 전/실시간 예상 소요 시간 표시용 — core/perf_profile.py 참고.
+        self._eta_tracker: _EtaTracker | None = None
+        self._eta_stage: str | None = None
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(1000)
+        self._eta_timer.timeout.connect(self._update_eta_label)
 
         self._build_ui()
         self._apply_settings_to_ui()
@@ -307,10 +389,19 @@ class MainWindow(QMainWindow):
         self._blink_animations: dict[str, QVariantAnimation] = {}
         self._start_blink("browse", self.browse_btn)  # 시작 시엔 파일이 선택 안 되어 있음
 
+        progress_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)  # indeterminate
         self.progress.setVisible(False)
-        layout.addWidget(self.progress)
+        progress_row.addWidget(self.progress, stretch=1)
+
+        # 스피너(진행바) 옆에 실행 전/실시간 예상 소요 시간을 보여줌 — core/perf_profile.py
+        # 의 예상치를 실행 시작 시 표시하고, 진행 중에는 1초마다 갱신(_update_eta_label).
+        self.eta_label = QLabel()
+        self.eta_label.setVisible(False)
+        self.eta_label.setStyleSheet("color: gray;")
+        progress_row.addWidget(self.eta_label)
+        layout.addLayout(progress_row)
 
         self.info_box = QTextEdit()
         self.info_box.setReadOnly(True)
@@ -528,6 +619,29 @@ class MainWindow(QMainWindow):
         color.setAlpha(int(90 + phase * 150))  # 90~240
         effect.setColor(color)
 
+    # --- 실행 전/실시간 예상 소요 시간 ------------------------------------------
+    def _start_eta(self, stage: str, pre_estimate_sec: float) -> None:
+        self._eta_stage = stage
+        self._eta_tracker = _EtaTracker(pre_estimate_sec)
+        self.eta_label.setVisible(True)
+        self._update_eta_label()
+        self._eta_timer.start()
+
+    def _stop_eta(self) -> None:
+        self._eta_timer.stop()
+        self._eta_tracker = None
+        self._eta_stage = None
+        self.eta_label.setVisible(False)
+
+    def _update_eta_label(self) -> None:
+        if self._eta_tracker is None or self._eta_stage is None:
+            return
+        remaining = self._eta_tracker.remaining()
+        elapsed = self._eta_tracker.elapsed()
+        stage_label = _STAGE_LABELS.get(self._eta_stage, self._eta_stage)
+        remaining_text = "곧 완료..." if remaining <= 0 else f"약 {_format_duration_kr(remaining)} 남음"
+        self.eta_label.setText(f"{stage_label} 예상: {remaining_text} (경과 {_format_duration_kr(elapsed)})")
+
     def _set_selected_path(self, path: Path) -> None:
         if not is_supported(path):
             QMessageBox.warning(self, "지원하지 않는 파일", f"지원하지 않는 확장자입니다: {path.suffix}")
@@ -535,8 +649,10 @@ class MainWindow(QMainWindow):
         self._stop_blink("browse", self.browse_btn)
         self._stop_blink("transcribe", self.transcribe_btn)  # 새 파일을 고르면 이전 추출 결과는 무효
         self._stop_blink("export", self.export_btn)  # 이전 전사 결과도 함께 무효
+        self._stop_eta()
         self._selected_path = path
         self._wav_path = None
+        self._media_info = None
         self.path_edit.setText(str(path))
         self.extract_btn.setEnabled(True)
         self.transcribe_btn.setEnabled(False)
@@ -558,6 +674,16 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.statusBar().showMessage("오디오 추출 중... (ffmpeg)")
 
+        # 추출 자체는 워커 안에서 다시 프로브하지만, 예상 소요 시간을 즉시 보여주려면
+        # 메인 스레드에서 가볍게 한 번 더 프로브해서 길이만 미리 알아둔다(ffprobe는
+        # 메타데이터만 읽어서 빠름). 프로브가 실패해도(예: 손상된 파일) 워커가 실제
+        # 오류를 다시 잡아서 보고하므로, 여기서는 예상 시간 표시만 생략하고 넘어간다.
+        try:
+            pre_duration = probe_media(self._selected_path).duration_sec
+            self._start_eta("extract", estimate_seconds("extract", pre_duration))
+        except MediaError:
+            pass
+
         self._worker = ExtractWorker(self._selected_path, DEFAULT_SETTINGS.output_dir)
         self._worker.succeeded.connect(self._on_extract_done)
         self._worker.failed.connect(self._on_extract_failed)
@@ -565,8 +691,12 @@ class MainWindow(QMainWindow):
 
     def _on_extract_done(self, info: MediaInfo, wav_path: Path) -> None:
         self.progress.setVisible(False)
+        if self._eta_tracker is not None:
+            record_actual("extract", info.duration_sec, self._eta_tracker.elapsed())
+        self._stop_eta()
         self.extract_btn.setEnabled(True)
         self._wav_path = wav_path
+        self._media_info = info
         self.transcribe_btn.setEnabled(True)
         self.info_box.setPlainText(_format_info(info) + f"\n\n추출된 STT용 오디오: {wav_path}")
         self.statusBar().showMessage("오디오 추출 완료. 전사를 시작할 수 있습니다.")
@@ -575,6 +705,7 @@ class MainWindow(QMainWindow):
 
     def _on_extract_failed(self, message: str) -> None:
         self.progress.setVisible(False)
+        self._stop_eta()
         self.extract_btn.setEnabled(True)
         self.statusBar().showMessage("오류 발생")
         QMessageBox.critical(self, "오류", message)
@@ -615,6 +746,7 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("전사 중...")
 
+        self._current_model_size = model_size
         self._transcribe_worker = TranscribeWorker(
             self._wav_path,
             engine_mode=s.engine_mode,
@@ -623,6 +755,7 @@ class MainWindow(QMainWindow):
             multilingual_mode=s.multilingual_mode,
             diarize=self.diarize_check.isChecked(),
             api_key=get_api_key(API_PROVIDERS[0]) if s.engine_mode == "api" else None,
+            audio_duration_sec=self._media_info.duration_sec if self._media_info else 0.0,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
         )
@@ -630,6 +763,8 @@ class MainWindow(QMainWindow):
         self._transcribe_worker.failed.connect(self._on_transcribe_failed)
         self._transcribe_worker.status.connect(self.statusBar().showMessage)
         self._transcribe_worker.progress.connect(self._on_transcribe_progress)
+        self._transcribe_worker.stage_started.connect(self._on_stage_started)
+        self._transcribe_worker.stage_done.connect(self._on_stage_done)
         self._transcribe_worker.start()
 
     def _on_transcribe_progress(self, done: int, total: int) -> None:
@@ -643,8 +778,25 @@ class MainWindow(QMainWindow):
         pct = max(0, min(100, int(done / total * 100)))
         self.progress.setValue(pct)
 
+        # STT 단계는 done/total이 뚝뚝 끊기지 않는 단일 카운터(윈도우 처리 수)라 실제
+        # 속도로 예상 시간을 다시 계산할 수 있음. 화자분리 내부 단계는 done/total이
+        # 단계마다 다시 0부터 시작해 신뢰할 수 없어서, 대신 사전 추정치 기반 카운트다운을
+        # 그대로 둔다(_start_eta에서 이미 설정됨).
+        if self._eta_tracker is not None and self._eta_stage == "stt":
+            self._eta_tracker.on_progress(done, total)
+            self._update_eta_label()
+
+    def _on_stage_started(self, stage: str, pre_estimate_sec: float) -> None:
+        self._start_eta(stage, pre_estimate_sec)
+
+    def _on_stage_done(self, stage: str, elapsed_sec: float) -> None:
+        if self._media_info is not None:
+            model_size = self._current_model_size if stage == "stt" else None
+            record_actual(stage, self._media_info.duration_sec, elapsed_sec, model_size=model_size)
+
     def _on_transcribe_done(self, segments: list[TranscriptSegment]) -> None:
         self.progress.setVisible(False)
+        self._stop_eta()
         self.transcribe_btn.setEnabled(True)
         self.extract_btn.setEnabled(True)
         self._last_segments = segments
@@ -661,6 +813,7 @@ class MainWindow(QMainWindow):
 
     def _on_transcribe_failed(self, message: str) -> None:
         self.progress.setVisible(False)
+        self._stop_eta()
         self.transcribe_btn.setEnabled(True)
         self.extract_btn.setEnabled(True)
         self.statusBar().showMessage("오류 발생")

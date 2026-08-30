@@ -5,6 +5,7 @@ venv/
 .env
 settings.json
 llm_selection.json
+perf_profile.json
 models/*
 !models/.gitkeep
 output/*
