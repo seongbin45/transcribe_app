@@ -1,5 +1,10 @@
 """설정 화면: 언어 선택, 로컬/API 엔진 전환, API 키 입력.
 
+옵션이 늘어날수록(특히 API 엔진별 키 입력칸) 창이 위아래로 계속 길어진다는 피드백을 받아,
+왼쪽 카테고리 목록 + 오른쪽 내용 패널 구조("환경설정" 창에서 흔한 마스터-디테일 패턴)로
+바꿨다. 카테고리를 눌러도, 엔진 라디오를 눌러 API 키 입력칸이 바뀌어도 창 높이는 항상
+고정 — 새로 나타나는 내용은 옆(패널) 안에서 자리를 바꿀 뿐 창을 늘리지 않는다.
+
 API 엔진은 두 가지: AssemblyAI(한 번의 호출로 전사+화자분리, 최대 10시간)와
 Groq + pyannoteAI(Groq가 초고속 STT, pyannoteAI가 화자분리 — 둘을 조합해서 씀,
 core/engines/groq_engine.py・pyannoteai_engine.py 참고). 후자를 고르면 키 입력칸이
@@ -16,9 +21,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -28,12 +35,22 @@ from core.secrets import delete_api_key, get_api_key, set_api_key
 from gui.constants import MODEL_CHOICES
 from gui.widgets.llm_model_dialog import LlmModelDialog
 
+# 창 크기를 이 값으로 고정 — 카테고리를 넘나들거나 엔진 라디오를 바꿔도 내용은
+# 항상 이 크기 안(오른쪽 패널 내부)에서만 바뀌고 창 자체는 늘어나지 않는다.
+# 처음엔 560을 썼다가 실제 스크린샷으로 API 키 패널이 잘려 보이는 걸 확인 — 원인은
+# (1) 라디오 라벨에 줄바꿈을 넣었더니 자동 줄바꿈이 안 되고 가장 긴 줄 기준으로 폭을
+# 요구한 것, (2) 로컬 모델 크기 콤보박스의 "large-v3 (권장, 느림·최초 실행 시 다운로드)"
+# 항목이 길어서 sizeHint가 390px까지 벌어진 것. 둘 다 고친 뒤 실측 sizeHint에 맞춰
+# 최종적으로 이 값으로 정함.
+_DIALOG_WIDTH = 860
+_DIALOG_HEIGHT = 460
+
 
 class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("설정")
-        self.setMinimumWidth(440)
+        self.setFixedSize(_DIALOG_WIDTH, _DIALOG_HEIGHT)
         self._settings = settings
         self._key_edits: dict[str, QLineEdit] = {}
         self._key_status_labels: dict[str, QLabel] = {}
@@ -41,9 +58,36 @@ class SettingsDialog(QDialog):
         self._load_from_settings(settings)
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
 
-        # --- 언어 -------------------------------------------------------
+        body = QHBoxLayout()
+        root.addLayout(body, stretch=1)
+
+        # --- 왼쪽: 카테고리 목록 ---------------------------------------------
+        self.category_list = QListWidget()
+        self.category_list.setFixedWidth(130)
+        self.category_list.addItems(["언어", "엔진 / API 키", "LLM / 고급"])
+        self.category_list.currentRowChanged.connect(self._on_category_changed)
+        body.addWidget(self.category_list)
+
+        # --- 오른쪽: 카테고리별 내용 패널 (선택 카테고리만 보이고 창 높이는 고정) ---
+        self.pages = QStackedWidget()
+        body.addWidget(self.pages, stretch=1)
+
+        self.pages.addWidget(self._build_language_page())
+        self.pages.addWidget(self._build_engine_page())
+        self.pages.addWidget(self._build_advanced_page())
+
+        # --- 확인/취소 (카테고리와 무관하게 항상 하단 고정) ---------------------
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _build_language_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
         lang_group = QGroupBox("언어")
         lang_layout = QVBoxLayout(lang_group)
 
@@ -58,14 +102,30 @@ class SettingsDialog(QDialog):
             lang_layout.addWidget(cb)
 
         layout.addWidget(lang_group)
+        layout.addStretch()
+        return page
 
-        # --- 엔진 ---------------------------------------------------------
+    def _build_engine_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QHBoxLayout(page)
+
+        # 왼쪽: 엔진 선택 라디오 + 로컬 모델 크기
+        left = QVBoxLayout()
         engine_group = QGroupBox("STT 엔진")
+        engine_group.setMaximumWidth(340)  # 오른쪽 key_stack과 균형 맞춤(남는 폭으로 안 늘어나게)
         engine_layout = QVBoxLayout(engine_group)
 
-        self.local_radio = QRadioButton("로컬 (faster-whisper + pyannote, 무료, CPU 사용)")
-        self.assemblyai_radio = QRadioButton("API - AssemblyAI (유료, 화자분리 포함 한 번에 처리, 최대 10시간)")
-        self.groq_radio = QRadioButton("API - Groq + pyannoteAI (유료, 초고속 클라우드, 실험적)")
+        # 라디오 라벨은 한 줄로 짧게 두고(왼쪽 칸이 넓어지는 걸 방지), 설명은 툴팁으로 —
+        # 원래 라벨에 줄바꿈을 넣어봤다가 라디오버튼이 자동으로 줄바꿈하지 않고 가장 긴
+        # 줄 기준으로 폭을 요구해서 오른쪽 API 키 패널이 창 밖으로 잘리는 걸 실제
+        # 스크린샷으로 확인하고(STT 엔진 그룹 sizeHint가 528px까지 벌어짐) 이렇게 고침.
+        self.local_radio = QRadioButton("로컬 (무료, CPU)")
+        self.local_radio.setToolTip("faster-whisper + pyannote로 이 컴퓨터에서 처리합니다. 무료지만 CPU만 써서 느립니다.")
+        self.assemblyai_radio = QRadioButton("API - AssemblyAI")
+        self.assemblyai_radio.setToolTip(
+            "유료. 전사+화자분리를 한 번의 호출로 처리합니다. 최대 10시간 길이 제한이 있습니다."
+        )
+        self.groq_radio = QRadioButton("API - Groq + pyannoteAI")
         self.groq_radio.setToolTip(
             "Groq(초고속 STT) + pyannoteAI(화자분리, 화자 수 힌트 지원)를 조합해서 씁니다.\n"
             "길이 제한은 요청당 크기(무료 티어 25MB)라서 앱이 자동으로 45분 단위 조각으로\n"
@@ -73,34 +133,66 @@ class SettingsDialog(QDialog):
             "언어는 조각(45분)마다 자동 감지되며, 로컬 엔진의 25초 단위 재판정만큼\n"
             "촘촘하지는 않습니다."
         )
-        engine_layout.addWidget(self.local_radio)
-        engine_layout.addWidget(self.assemblyai_radio)
-        engine_layout.addWidget(self.groq_radio)
         for radio in (self.local_radio, self.assemblyai_radio, self.groq_radio):
             radio.toggled.connect(self._on_engine_choice_changed)
+            engine_layout.addWidget(radio)
 
-        model_row = QHBoxLayout()
+        model_row = QVBoxLayout()
         model_row.addWidget(QLabel("로컬 모델 크기:"))
         self.model_combo = QComboBox()
         for label, _value in MODEL_CHOICES:
             self.model_combo.addItem(label)
+        # 항목 중 "large-v3 (권장, 느림·최초 실행 시 다운로드)"가 길어서 combo box의
+        # sizeHint가 390px까지 벌어지는 바람에 옆의 API 키 패널이 창 밖으로 밀려 잘리는
+        # 걸 실제로 확인했음 — 닫힌 상태 폭은 좁게 고정하고(길면 말줄임표), 펼치면
+        # 목록에서는 전체 텍스트가 그대로 보인다.
+        self.model_combo.setMaximumWidth(190)
+        self.model_combo.setToolTip(self.model_combo.currentText())
+        self.model_combo.currentTextChanged.connect(self.model_combo.setToolTip)
         model_row.addWidget(self.model_combo)
         engine_layout.addLayout(model_row)
 
-        layout.addWidget(engine_group)
+        left.addWidget(engine_group)
+        left.addStretch()
+        page_layout.addLayout(left)
 
-        # --- API 키 -------------------------------------------------------
+        # 오른쪽: 선택한 엔진에 필요한 API 키 입력칸만 옆에 표시(스택 전환 — 라디오를
+        # 바꿔도 이 패널 자리만 바뀔 뿐 페이지/창 높이는 그대로).
+        self.key_stack = QStackedWidget()
+        self.key_stack.setFixedWidth(340)
+        page_layout.addWidget(self.key_stack)
+
+        self.local_key_page = QLabel("로컬 엔진은 API 키가 필요 없습니다.")
+        self.local_key_page.setWordWrap(True)
+        self.local_key_page.setStyleSheet("color: gray;")
+        self.key_stack.addWidget(self._wrap_top(self.local_key_page))
+
         self.assemblyai_key_group = self._build_key_section("assemblyai", "AssemblyAI")
-        layout.addWidget(self.assemblyai_key_group)
+        self.key_stack.addWidget(self._wrap_top(self.assemblyai_key_group))
 
-        self.groq_keys_container = QWidget()
-        groq_keys_layout = QVBoxLayout(self.groq_keys_container)
+        groq_keys_page = QWidget()
+        groq_keys_layout = QVBoxLayout(groq_keys_page)
         groq_keys_layout.setContentsMargins(0, 0, 0, 0)
         groq_keys_layout.addWidget(self._build_key_section("groq", "Groq"))
         groq_keys_layout.addWidget(self._build_key_section("pyannoteai", "pyannoteAI"))
-        layout.addWidget(self.groq_keys_container)
+        self.key_stack.addWidget(self._wrap_top(groq_keys_page))
 
-        # --- LLM 모델(화자 병합 제안) ----------------------------------------
+        return page
+
+    @staticmethod
+    def _wrap_top(widget: QWidget) -> QWidget:
+        """위쪽에 붙여 놓기 위한 래퍼(안 그러면 QStackedWidget 안에서 세로 가운데 정렬됨)."""
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(widget)
+        layout.addStretch()
+        return wrapper
+
+    def _build_advanced_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
         llm_group = QGroupBox("LLM 모델 (화자 병합 제안)")
         llm_layout = QVBoxLayout(llm_group)
         llm_layout.addWidget(
@@ -118,18 +210,13 @@ class SettingsDialog(QDialog):
             "끄면 1차 제공자 판단만 사용합니다(호출은 절반, 신뢰도는 낮아짐)."
         )
         llm_layout.addWidget(self.cross_validate_check)
-
         layout.addWidget(llm_group)
 
-        # --- 화자분리 기본값 ------------------------------------------------
         self.diarize_default_check = QCheckBox("전사 시작 시 기본적으로 화자분리 포함")
         layout.addWidget(self.diarize_default_check)
 
-        # --- 확인/취소 ------------------------------------------------------
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        layout.addStretch()
+        return page
 
     def _build_key_section(self, provider: str, display_name: str) -> QGroupBox:
         """provider 하나에 대한 "상태 표시 + 키 입력 + 표시/저장/삭제" 묶음을 만든다.
@@ -191,14 +278,24 @@ class SettingsDialog(QDialog):
         self.cross_validate_check.setChecked(settings.cross_validate_merges)
         self._refresh_api_status()
 
+        self.category_list.setCurrentRow(0)
+
     def _refresh_api_status(self) -> None:
         for provider, label in self._key_status_labels.items():
             has_key = bool(get_api_key(provider))
             label.setText("현재 상태: 저장된 키 있음" if has_key else "현재 상태: 저장된 키 없음")
 
+    def _on_category_changed(self, row: int) -> None:
+        if row >= 0:
+            self.pages.setCurrentIndex(row)
+
     def _on_engine_choice_changed(self, _checked: bool = False) -> None:
-        self.assemblyai_key_group.setVisible(self.assemblyai_radio.isChecked())
-        self.groq_keys_container.setVisible(self.groq_radio.isChecked())
+        if self.groq_radio.isChecked():
+            self.key_stack.setCurrentIndex(2)
+        elif self.assemblyai_radio.isChecked():
+            self.key_stack.setCurrentIndex(1)
+        else:
+            self.key_stack.setCurrentIndex(0)
 
     def _on_multilingual_toggled(self, checked: bool) -> None:
         for cb in self.language_checks.values():
