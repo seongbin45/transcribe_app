@@ -46,20 +46,29 @@ from gui.widgets.settings_dialog import SettingsDialog
 # 보이도록, 위는 밝고 아래는 진한 그라디언트(빛이 위에서 온다고 가정)로 입체감을 주고,
 # 아래쪽에 진한 테두리를 둬서 눌리지 않은 볼록한 모서리처럼 보이게 한다.
 # 실제 그림자(box-shadow)는 QSS가 지원하지 않아서 QGraphicsDropShadowEffect로 별도 적용한다.
-_BLINK_RAISED_STYLE = """
-QPushButton {
-    background-color: qlineargradient(
-        x1:0, y1:0, x2:0, y2:1,
-        stop:0 #ffe082, stop:0.45 #ffb300, stop:1 #ff8f00
-    );
-    border: 2px solid #e65100;
-    border-bottom: 3px solid #bf360c;
-    border-radius: 10px;
-    color: #3e2723;
-    font-weight: bold;
-    padding: 6px 14px;
-}
-"""
+#
+# alpha를 매개변수로 받는 이유: 그림자만 깜빡이니 잘 안 보인다는 피드백을 받아서,
+# 버튼 자체의 색(배경/테두리/글자)도 매 애니메이션 프레임마다 이 함수로 새로 만든
+# QSS를 다시 적용해 투명해졌다 진해지는 게 눈에 보이게 한다(QSS는 프로퍼티 애니메이션
+# 대상이 아니라서, 프레임마다 문자열을 직접 다시 만들어 setStyleSheet 하는 방식을 씀).
+def _raised_style(alpha: int) -> str:
+    a = max(0, min(255, alpha))
+    return f"""
+    QPushButton {{
+        background-color: qlineargradient(
+            x1:0, y1:0, x2:0, y2:1,
+            stop:0 rgba(255, 224, 130, {a}),
+            stop:0.45 rgba(255, 179, 0, {a}),
+            stop:1 rgba(255, 143, 0, {a})
+        );
+        border: 2px solid rgba(230, 81, 0, {a});
+        border-bottom: 3px solid rgba(191, 54, 12, {a});
+        border-radius: 10px;
+        color: rgba(62, 39, 35, {a});
+        font-weight: bold;
+        padding: 6px 14px;
+    }}
+    """
 
 
 def _format_duration(seconds: float) -> str:
@@ -469,22 +478,22 @@ class MainWindow(QMainWindow):
             self._set_selected_path(Path(file_path))
 
     def _start_blink(self, key: str, button: QPushButton) -> None:
-        """버튼을 입체(키캡) 스타일로 계속 띄워둔 채, 그림자를 사인 곡선처럼 부드럽게
-        부풀렸다 줄이며 "숨쉬는" 느낌으로 눈에 띄게 한다.
+        """버튼을 입체(키캡) 스타일로 띄워둔 채, 버튼 자체의 색 투명도와 그림자를 함께
+        사인 곡선처럼 부드럽게 오가게 해서 "숨쉬는" 느낌으로 눈에 띄게 한다.
 
         예전엔 500ms마다 평평한 상태 <-> 입체 상태를 QTimer로 뚝뚝 끊어 전환했는데
-        ("깜빡임이 좀 더 부드러웠으면" 하는 피드백을 받음), 대신 버튼은 항상 입체 상태를
-        유지하고 QVariantAnimation(easing=InOutSine, 무한 반복)으로 그림자의 흐림 정도/
-        투명도만 연속적으로 오가게 해서 뚝뚝 끊기지 않는 펄스로 바꿨다.
+        ("깜빡임이 좀 더 부드러웠으면" 하는 피드백을 받아 애니메이션으로 바꿈), 그다음엔
+        그림자만 애니메이션되고 버튼 자체는 항상 불투명이라 잘 안 보인다는 피드백을 받아서,
+        버튼의 배경/테두리/글자 색 알파도 같은 위상으로 같이 옅어졌다 진해지게 했다
+        (QSS는 애니메이션 프로퍼티가 아니라서, 프레임마다 `_raised_style()`로 문자열을
+        새로 만들어 `setStyleSheet`을 다시 호출하는 방식).
         """
         self._stop_blink(key, button)  # 이미 돌고 있었다면 깨끗이 정리하고 새로 시작
 
-        button.setStyleSheet(_BLINK_RAISED_STYLE)
         effect = QGraphicsDropShadowEffect(button)
         effect.setOffset(0, 5)
-        effect.setColor(QColor(191, 54, 12, 90))
-        effect.setBlurRadius(10)
         button.setGraphicsEffect(effect)
+        self._apply_blink_frame(effect, button, 0.0)  # 애니메이션 첫 틱 전에도 스타일이 비어있지 않도록
 
         anim = QVariantAnimation(self)
         anim.setDuration(900)
@@ -493,7 +502,7 @@ class MainWindow(QMainWindow):
         anim.setEndValue(0.0)
         anim.setEasingCurve(QEasingCurve.Type.InOutSine)
         anim.setLoopCount(-1)
-        anim.valueChanged.connect(lambda v, eff=effect: self._apply_blink_frame(eff, v))
+        anim.valueChanged.connect(lambda v, eff=effect, btn=button: self._apply_blink_frame(eff, btn, v))
         anim.start()
 
         self._blink_effects[key] = effect
@@ -508,10 +517,14 @@ class MainWindow(QMainWindow):
         button.setGraphicsEffect(None)  # 붙어 있던 그림자 이펙트 제거(평평한 기본 버튼으로 복귀)
 
     @staticmethod
-    def _apply_blink_frame(effect: QGraphicsDropShadowEffect, phase: float) -> None:
-        """phase(0~1, 사인 곡선처럼 부드럽게 오감)에 맞춰 그림자를 숨쉬듯 부풀렸다 줄인다."""
+    def _apply_blink_frame(effect: QGraphicsDropShadowEffect, button: QPushButton, phase: float) -> None:
+        """phase(0~1, 사인 곡선처럼 부드럽게 오감)에 맞춰 버튼 색과 그림자를 함께 숨쉬듯
+        부풀렸다 줄인다 — 버튼 자체가 옅어졌다 진해지는 것과 그림자 번짐이 같이 움직여야
+        "깜빡인다"는 게 눈에 뚜렷하게 보인다."""
+        button.setStyleSheet(_raised_style(int(70 + phase * 185)))  # 버튼 자체 투명도: 70~255
+
         effect.setBlurRadius(10 + phase * 22)  # 10~32
-        color = effect.color()
+        color = QColor(191, 54, 12)
         color.setAlpha(int(90 + phase * 150))  # 90~240
         effect.setColor(color)
 
