@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .env
 settings.json
+llm_selection.json
 models/*
 !models/.gitkeep
 output/*

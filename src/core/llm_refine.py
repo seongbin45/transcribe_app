@@ -20,14 +20,16 @@ import time
 import requests
 
 from .align import SpeakerTranscriptSegment
+from .llm_catalog import GEMINI_GENERATE_URL_TMPL, clear_selected_model, ensure_selected_model
 from .secrets import get_api_key
 
 logger = logging.getLogger(__name__)
 
 MAX_TRANSCRIPT_CHARS = 60000  # 매우 긴 녹음은 앞부분만 보고 병합 판단 (한계는 README에 명시)
 
-GEMINI_MODEL = "gemini-3.6-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# 모델 id는 하드코딩하지 않는다 — core/llm_catalog.py가 실시간으로 모델 목록을 받아와
+# 사용 가능한 걸 골라 llm_selection.json에 저장해두고, 여기서는 그걸 읽어서 쓴다.
+# (Gemini 모델명이 자주 바뀌어서 실제로 하드코딩된 모델이 막힌 적이 있었음 — README 참고)
 
 # provider -> 실패 시 재시도 횟수. 무료 키는 이용자가 많아 레이트리밋에 걸리기 쉬우므로 넉넉히.
 RETRY_ATTEMPTS = {"gemini_free": 25, "gemini": 3}
@@ -84,13 +86,14 @@ def _resolve(label: str, merges: dict[str, str]) -> str:
     return label
 
 
-def _call_gemini(user_content: str, api_key: str) -> str:
+def _call_gemini(user_content: str, api_key: str, model: str) -> str:
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"parts": [{"text": user_content}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    resp = requests.post(f"{GEMINI_URL}?key={api_key}", json=payload, timeout=120)
+    url = GEMINI_GENERATE_URL_TMPL.format(model=model)
+    resp = requests.post(f"{url}?key={api_key}", json=payload, timeout=120)
     resp.raise_for_status()
     return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -106,16 +109,24 @@ def _is_retryable(exc: Exception) -> bool:
 
 def _call_with_retry(
     user_content: str,
+    provider: str,
     api_key: str,
+    model: str,
     max_attempts: int,
     status_callback=None,
 ) -> str:
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return _call_gemini(user_content, api_key)
+            return _call_gemini(user_content, api_key, model)
         except Exception as e:  # noqa: BLE001
             last_exc = e
+            status = e.response.status_code if isinstance(e, requests.exceptions.HTTPError) and e.response is not None else None
+            if status == 404:
+                # 선택해둔 모델 자체가 더 이상 이 키로 안 되는 것(예: 신규 사용자 대상 지원 종료).
+                # 다음 실행 때는 새로 골라 쓰도록 저장된 선택을 지운다.
+                logger.warning("[%s] 모델 '%s' 호출이 404로 실패해 선택을 초기화합니다: %s", provider, model, e)
+                clear_selected_model(provider)
             retryable = _is_retryable(e)
             if not retryable or attempt == max_attempts:
                 raise
@@ -162,8 +173,12 @@ def suggest_merges(
         max_attempts = RETRY_ATTEMPTS.get(provider, 3)
         try:
             if status_callback:
-                status_callback(f"LLM({provider}) 화자 병합 제안 요청 중...")
-            content = _call_with_retry(user_content, api_key, max_attempts, status_callback)
+                status_callback(f"LLM({provider}) 사용할 모델 확인 중...")
+            model = ensure_selected_model(provider, api_key)
+
+            if status_callback:
+                status_callback(f"LLM({provider}, {model}) 화자 병합 제안 요청 중...")
+            content = _call_with_retry(user_content, provider, api_key, model, max_attempts, status_callback)
         except Exception as e:  # noqa: BLE001
             logger.warning("[%s] 모든 재시도 실패, 다음 제공자로 롤백: %s", provider, e)
             errors.append(f"{provider}: {e}")
