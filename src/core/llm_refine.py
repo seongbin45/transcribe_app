@@ -1,4 +1,4 @@
-"""화자분리 결과를 LLM(AssemblyAI LLM Gateway)으로 문맥 기반 보정.
+"""화자분리 결과를 LLM으로 문맥 기반 보정 (AssemblyAI LLM Gateway 또는 Gemini).
 
 음향(목소리) 기반 화자분리는 톤이 바뀌거나 짧게 끼어들면 같은 사람을 다른 화자로
 잘못 나누는 경우가 있다. 이 모듈은 전사 "내용"을 LLM에게 보여주고, 문맥상 명백히
@@ -13,14 +13,19 @@ import logging
 import requests
 
 from .align import SpeakerTranscriptSegment
+from .secrets import get_api_key
 
 logger = logging.getLogger(__name__)
 
-LLM_GATEWAY_URL = "https://llm-gateway.assemblyai.com/v1/chat/completions"
+MAX_TRANSCRIPT_CHARS = 60000  # 매우 긴 녹음은 앞부분만 보고 병합 판단 (한계는 README에 명시)
+
+ASSEMBLYAI_LLM_GATEWAY_URL = "https://llm-gateway.assemblyai.com/v1/chat/completions"
 # 계정 등급에 따라 접근 가능한 모델이 다름. claude-sonnet-4-6 등 상위 모델은 이 계정에서
 # "account does not have access" 400 에러가 나서, 실제로 접근 가능한 것으로 확인된 모델 사용.
-MODEL = "qwen3.5-4b-32k-fast"
-MAX_TRANSCRIPT_CHARS = 60000  # 매우 긴 녹음은 앞부분만 보고 병합 판단 (한계는 README에 명시)
+ASSEMBLYAI_MODEL = "qwen3.5-4b-32k-fast"
+
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 SYSTEM_PROMPT = (
     "당신은 화자분리(diarization) 결과를 검토하는 보조자입니다. "
@@ -33,12 +38,23 @@ SYSTEM_PROMPT = (
     "끊기고 바로 다음에 다른 화자 번호가 그 문장을 이어받아 완성하는 경우)\n\n"
     "역할/주제/말투가 다르면(예: 한쪽은 등록 안내, 다른 쪽은 기술 이야기) 절대 같은 사람으로 "
     "보지 마세요. 확신이 90% 미만이면 병합하지 마세요. 병합을 놓치는 것이 서로 다른 사람을 "
-    "합치는 것보다 훨씬 낫습니다.\n\n"
+    "합치는 것보다 훨씬 낫습니다. 입력에 나온 화자 라벨만 사용하고, 새로운 라벨을 만들어내지 마세요.\n\n"
     '먼저 "reasoning" 필드에 후보들을 간단히 검토한 근거를 한두 문장으로 쓰고, 그다음 "merges"에 '
     "최종 결정만 담아 JSON으로 출력하세요. 다른 텍스트는 출력하지 마세요. 형식: "
     '{"reasoning": "...", "merges": {"화자 F": "화자 A"}} '
     "(화자 F를 화자 A로 병합). 병합할 게 없으면 {\"reasoning\": \"...\", \"merges\": {}}."
 )
+
+
+def pick_provider() -> tuple[str, str] | None:
+    """사용 가능한 LLM 제공자를 우선순위대로 고른다: Gemini(더 강력한 모델) > AssemblyAI(계정에 따라 소형 모델만 접근 가능)."""
+    gemini_key = get_api_key("gemini")
+    if gemini_key:
+        return "gemini", gemini_key
+    assemblyai_key = get_api_key("assemblyai")
+    if assemblyai_key:
+        return "assemblyai", assemblyai_key
+    return None
 
 
 def _strip_code_fence(text: str) -> str:
@@ -58,15 +74,46 @@ def _resolve(label: str, merges: dict[str, str]) -> str:
     return label
 
 
+def _call_assemblyai(user_content: str, api_key: str) -> str:
+    payload = {
+        "model": ASSEMBLYAI_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": 700,
+    }
+    resp = requests.post(
+        ASSEMBLYAI_LLM_GATEWAY_URL,
+        headers={"authorization": api_key, "content-type": "application/json"},
+        json=payload,
+        timeout=180,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _call_gemini(user_content: str, api_key: str) -> str:
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": user_content}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    resp = requests.post(f"{GEMINI_URL}?key={api_key}", json=payload, timeout=180)
+    resp.raise_for_status()
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
 def suggest_merges(
     segments: list[SpeakerTranscriptSegment],
+    provider: str,
     api_key: str,
 ) -> tuple[dict[str, str], str]:
     """LLM에게 화자 병합을 '제안'만 받아온다 (적용하지 않음).
 
-    검증 결과 이 기능이 쓸 수 있는 모델(계정 등급상 qwen3.5-4b-32k-fast만 접근 가능)이
-    가끔 명백히 다른 사람을 병합하자고 하거나, 존재하지 않는 화자 라벨을 지어내는 것을
-    확인했다. 그래서 자동 적용하지 않고 사람이 검토 후 선택 적용하는 것을 전제로 한다.
+    검증 결과 이 기능이 쓸 수 있는 모델에 따라 가끔 명백히 다른 사람을 병합하자고
+    하거나, 존재하지 않는 화자 라벨을 지어내는 것을 확인했다. 그래서 자동 적용하지
+    않고 사람이 검토 후 선택 적용하는 것을 전제로 한다.
 
     반환: (merges 딕셔너리, LLM이 남긴 판단 근거 텍스트)
     """
@@ -81,24 +128,15 @@ def suggest_merges(
             break
         lines.append(line)
         total += len(line)
+    user_content = "\n".join(lines)
 
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "\n".join(lines)},
-        ],
-        "max_tokens": 700,
-    }
+    if provider == "gemini":
+        content = _call_gemini(user_content, api_key)
+    elif provider == "assemblyai":
+        content = _call_assemblyai(user_content, api_key)
+    else:
+        raise ValueError(f"알 수 없는 LLM 제공자: {provider}")
 
-    resp = requests.post(
-        LLM_GATEWAY_URL,
-        headers={"authorization": api_key, "content-type": "application/json"},
-        json=payload,
-        timeout=180,
-    )
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
     parsed = json.loads(_strip_code_fence(content))
     merges = parsed.get("merges") or {}
     reasoning = parsed.get("reasoning") or ""
@@ -111,7 +149,7 @@ def suggest_merges(
         if src in valid_labels and dst in valid_labels and src != dst
     }
 
-    logger.info("LLM 화자 병합 제안: %s (근거: %s)", merges, reasoning)
+    logger.info("[%s] LLM 화자 병합 제안: %s (근거: %s)", provider, merges, reasoning)
     return merges, reasoning
 
 

@@ -21,6 +21,7 @@ KEYRING_SERVICE = "transcribe_app"
 # provider -> .env에서 확인할 환경변수 이름 후보들
 _ENV_VAR_CANDIDATES = {
     "assemblyai": ["ASSEMBLYAI_API_KEY", "ASSEMBLY_AI_API_KEY"],
+    "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
 }
 
 

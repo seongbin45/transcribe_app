@@ -31,7 +31,7 @@ from core.engines.local_whisper import LocalWhisperEngine
 from core.exporters.docx_exporter import export_docx
 from core.exporters.markdown_exporter import export_markdown, export_txt
 from core.exporters.subtitle_exporter import export_srt, export_vtt
-from core.llm_refine import apply_merges, suggest_merges
+from core.llm_refine import apply_merges, pick_provider, suggest_merges
 from core.secrets import get_api_key, get_hf_token
 from core.settings_store import load_settings, save_settings
 from gui.constants import EXPORT_FORMATS, MODEL_CHOICES
@@ -188,14 +188,15 @@ class MergeSuggestWorker(QThread):
     succeeded = Signal(dict, str)  # merges, reasoning
     failed = Signal(str)
 
-    def __init__(self, segments: list[SpeakerTranscriptSegment], api_key: str):
+    def __init__(self, segments: list[SpeakerTranscriptSegment], provider: str, api_key: str):
         super().__init__()
         self.segments = segments
+        self.provider = provider
         self.api_key = api_key
 
     def run(self) -> None:
         try:
-            merges, reasoning = suggest_merges(self.segments, self.api_key)
+            merges, reasoning = suggest_merges(self.segments, self.provider, self.api_key)
             self.succeeded.emit(merges, reasoning)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(f"화자 병합 제안 요청 중 오류: {e}")
@@ -312,7 +313,8 @@ class MainWindow(QMainWindow):
         self.merge_suggest_btn = QPushButton("화자 병합 제안 받기 (LLM, 실험적)")
         self.merge_suggest_btn.setEnabled(False)
         self.merge_suggest_btn.setToolTip(
-            "AssemblyAI API 키가 필요합니다. LLM이 문맥을 보고 화자 병합을 '제안'만 하며,\n"
+            "GEMINI_API_KEY(.env) 또는 AssemblyAI API 키가 필요합니다 (Gemini 우선 사용).\n"
+            "LLM이 문맥을 보고 화자 병합을 '제안'만 하며,\n"
             "제안이 틀릴 수 있어 검토 창에서 직접 체크한 항목만 적용됩니다."
         )
         self.merge_suggest_btn.clicked.connect(self._on_merge_suggest)
@@ -488,7 +490,7 @@ class MainWindow(QMainWindow):
         self._last_segments = segments
         self.export_btn.setEnabled(bool(segments))
         has_speakers = bool(segments) and hasattr(segments[0], "speaker")
-        self.merge_suggest_btn.setEnabled(has_speakers and bool(get_api_key(API_PROVIDERS[0])))
+        self.merge_suggest_btn.setEnabled(has_speakers and pick_provider() is not None)
         self.transcript_box.setPlainText(_format_transcript(segments))
         self.statusBar().showMessage(f"전사 완료 ({len(segments)}개 구간)")
 
@@ -500,18 +502,21 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "오류", message)
 
     def _on_merge_suggest(self) -> None:
-        api_key = get_api_key(API_PROVIDERS[0])
-        if not api_key:
-            QMessageBox.warning(self, "API 키 필요", "설정에서 AssemblyAI API 키를 먼저 입력해주세요.")
+        picked = pick_provider()
+        if not picked:
+            QMessageBox.warning(
+                self, "API 키 필요", "GEMINI_API_KEY(.env) 또는 설정의 AssemblyAI API 키가 필요합니다."
+            )
             return
         if not self._last_segments:
             return
+        provider, api_key = picked
 
         self.merge_suggest_btn.setEnabled(False)
         self.progress.setVisible(True)
-        self.statusBar().showMessage("LLM에게 화자 병합 제안 요청 중...")
+        self.statusBar().showMessage(f"LLM({provider})에게 화자 병합 제안 요청 중...")
 
-        self._merge_worker = MergeSuggestWorker(self._last_segments, api_key)
+        self._merge_worker = MergeSuggestWorker(self._last_segments, provider, api_key)
         self._merge_worker.succeeded.connect(self._on_merge_suggest_done)
         self._merge_worker.failed.connect(self._on_merge_suggest_failed)
         self._merge_worker.start()
