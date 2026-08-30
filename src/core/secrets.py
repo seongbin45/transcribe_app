@@ -22,6 +22,7 @@ KEYRING_SERVICE = "transcribe_app"
 _ENV_VAR_CANDIDATES = {
     "assemblyai": ["ASSEMBLYAI_API_KEY", "ASSEMBLY_AI_API_KEY"],
     "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    "gemini_free": ["GEMINI_FREE_KEY"],
 }
 
 

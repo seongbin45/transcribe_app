@@ -1,14 +1,21 @@
-"""화자분리 결과를 LLM으로 문맥 기반 보정 (AssemblyAI LLM Gateway 또는 Gemini).
+"""화자분리 결과를 LLM(Gemini)으로 문맥 기반 보정.
 
 음향(목소리) 기반 화자분리는 톤이 바뀌거나 짧게 끼어들면 같은 사람을 다른 화자로
 잘못 나누는 경우가 있다. 이 모듈은 전사 "내용"을 LLM에게 보여주고, 문맥상 명백히
 같은 사람인데 다른 화자 번호로 나뉜 경우의 "병합 매핑"만 받아서 적용한다.
 텍스트/타임스탬프를 LLM이 다시 쓰게 하지 않고 라벨 매핑만 요청해서 환각 위험을 최소화한다.
+
+제공자: AssemblyAI LLM Gateway는 이 용도로 사용하지 않는다(정책) — 접근 가능한 소형 모델이
+명백히 다른 사람을 병합하자고 제안하거나 존재하지 않는 화자 라벨을 지어내는 걸 확인했기 때문.
+대신 Gemini만 사용하며, 무료 키(GEMINI_FREE_KEY)를 우선 사용하고 실패 시 일반 키(GEMINI_API_KEY)로
+롤백한다. 무료 키는 이용자가 많아 429(rate limit) 등으로 실패하기 쉬워 재시도 횟수를 넉넉히 둔다.
 """
 from __future__ import annotations
 
 import json
 import logging
+import random
+import time
 
 import requests
 
@@ -19,13 +26,14 @@ logger = logging.getLogger(__name__)
 
 MAX_TRANSCRIPT_CHARS = 60000  # 매우 긴 녹음은 앞부분만 보고 병합 판단 (한계는 README에 명시)
 
-ASSEMBLYAI_LLM_GATEWAY_URL = "https://llm-gateway.assemblyai.com/v1/chat/completions"
-# 계정 등급에 따라 접근 가능한 모델이 다름. claude-sonnet-4-6 등 상위 모델은 이 계정에서
-# "account does not have access" 400 에러가 나서, 실제로 접근 가능한 것으로 확인된 모델 사용.
-ASSEMBLYAI_MODEL = "qwen3.5-4b-32k-fast"
-
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# provider -> 실패 시 재시도 횟수. 무료 키는 이용자가 많아 레이트리밋에 걸리기 쉬우므로 넉넉히.
+RETRY_ATTEMPTS = {"gemini_free": 25, "gemini": 3}
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+_RETRY_BASE_DELAY = 2.0
+_RETRY_MAX_DELAY = 15.0
 
 SYSTEM_PROMPT = (
     "당신은 화자분리(diarization) 결과를 검토하는 보조자입니다. "
@@ -46,15 +54,17 @@ SYSTEM_PROMPT = (
 )
 
 
-def pick_provider() -> tuple[str, str] | None:
-    """사용 가능한 LLM 제공자를 우선순위대로 고른다: Gemini(더 강력한 모델) > AssemblyAI(계정에 따라 소형 모델만 접근 가능)."""
-    gemini_key = get_api_key("gemini")
-    if gemini_key:
-        return "gemini", gemini_key
-    assemblyai_key = get_api_key("assemblyai")
-    if assemblyai_key:
-        return "assemblyai", assemblyai_key
-    return None
+def get_provider_candidates() -> list[tuple[str, str]]:
+    """우선순위대로 (provider, api_key) 후보를 반환. 무료 Gemini 키 -> 일반 Gemini 키.
+
+    AssemblyAI LLM Gateway는 화자 병합 용도로는 사용하지 않는다(정책 — README 참고).
+    """
+    candidates = []
+    for provider in ("gemini_free", "gemini"):
+        key = get_api_key(provider)
+        if key:
+            candidates.append((provider, key))
+    return candidates
 
 
 def _strip_code_fence(text: str) -> str:
@@ -74,51 +84,68 @@ def _resolve(label: str, merges: dict[str, str]) -> str:
     return label
 
 
-def _call_assemblyai(user_content: str, api_key: str) -> str:
-    payload = {
-        "model": ASSEMBLYAI_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "max_tokens": 700,
-    }
-    resp = requests.post(
-        ASSEMBLYAI_LLM_GATEWAY_URL,
-        headers={"authorization": api_key, "content-type": "application/json"},
-        json=payload,
-        timeout=180,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
-
-
 def _call_gemini(user_content: str, api_key: str) -> str:
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"parts": [{"text": user_content}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    resp = requests.post(f"{GEMINI_URL}?key={api_key}", json=payload, timeout=180)
+    resp = requests.post(f"{GEMINI_URL}?key={api_key}", json=payload, timeout=120)
     resp.raise_for_status()
     return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, requests.exceptions.HTTPError):
+        status = exc.response.status_code if exc.response is not None else None
+        return status in RETRYABLE_STATUS
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True  # 타임아웃/연결 오류 등
+    return False
+
+
+def _call_with_retry(
+    user_content: str,
+    api_key: str,
+    max_attempts: int,
+    status_callback=None,
+) -> str:
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _call_gemini(user_content, api_key)
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            retryable = _is_retryable(e)
+            if not retryable or attempt == max_attempts:
+                raise
+            delay = min(_RETRY_BASE_DELAY * (1.5 ** (attempt - 1)), _RETRY_MAX_DELAY) + random.uniform(0, 1)
+            msg = f"Gemini 호출 실패({e}), {attempt}/{max_attempts}번째 재시도까지 {delay:.0f}초 대기..."
+            logger.warning(msg)
+            if status_callback:
+                status_callback(f"재시도 {attempt}/{max_attempts} (약 {delay:.0f}초 후)...")
+            time.sleep(delay)
+    raise last_exc  # pragma: no cover — 루프가 항상 return/raise로 빠짐
+
+
 def suggest_merges(
     segments: list[SpeakerTranscriptSegment],
-    provider: str,
-    api_key: str,
-) -> tuple[dict[str, str], str]:
+    status_callback=None,
+) -> tuple[dict[str, str], str, str]:
     """LLM에게 화자 병합을 '제안'만 받아온다 (적용하지 않음).
 
-    검증 결과 이 기능이 쓸 수 있는 모델에 따라 가끔 명백히 다른 사람을 병합하자고
-    하거나, 존재하지 않는 화자 라벨을 지어내는 것을 확인했다. 그래서 자동 적용하지
-    않고 사람이 검토 후 선택 적용하는 것을 전제로 한다.
+    무료 Gemini 키를 우선 시도(최대 25회 재시도)하고, 모두 실패하면 일반 Gemini 키로
+    롤백한다. 검증 결과 이 기능은 자동 적용하지 않고 사람이 검토 후 선택 적용하는 것을
+    전제로 한다 (LLM이 가끔 존재하지 않는 화자 라벨을 지어내는 것을 확인했기 때문).
 
-    반환: (merges 딕셔너리, LLM이 남긴 판단 근거 텍스트)
+    반환: (merges 딕셔너리, LLM이 남긴 판단 근거 텍스트, 실제 사용된 provider)
     """
-    if not segments or not api_key:
-        return {}, ""
+    if not segments:
+        return {}, "", ""
+
+    candidates = get_provider_candidates()
+    if not candidates:
+        return {}, "", ""
 
     lines = []
     total = 0
@@ -130,27 +157,34 @@ def suggest_merges(
         total += len(line)
     user_content = "\n".join(lines)
 
-    if provider == "gemini":
-        content = _call_gemini(user_content, api_key)
-    elif provider == "assemblyai":
-        content = _call_assemblyai(user_content, api_key)
-    else:
-        raise ValueError(f"알 수 없는 LLM 제공자: {provider}")
+    errors: list[str] = []
+    for provider, api_key in candidates:
+        max_attempts = RETRY_ATTEMPTS.get(provider, 3)
+        try:
+            if status_callback:
+                status_callback(f"LLM({provider}) 화자 병합 제안 요청 중...")
+            content = _call_with_retry(user_content, api_key, max_attempts, status_callback)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[%s] 모든 재시도 실패, 다음 제공자로 롤백: %s", provider, e)
+            errors.append(f"{provider}: {e}")
+            continue
 
-    parsed = json.loads(_strip_code_fence(content))
-    merges = parsed.get("merges") or {}
-    reasoning = parsed.get("reasoning") or ""
+        parsed = json.loads(_strip_code_fence(content))
+        merges = parsed.get("merges") or {}
+        reasoning = parsed.get("reasoning") or ""
 
-    # 존재하지 않는(입력에 없던) 화자 라벨을 지어내는 경우가 있어, 실제 라벨만 유효하게 취급.
-    valid_labels = {seg.speaker for seg in segments}
-    merges = {
-        src: dst
-        for src, dst in merges.items()
-        if src in valid_labels and dst in valid_labels and src != dst
-    }
+        # 존재하지 않는(입력에 없던) 화자 라벨을 지어내는 경우가 있어, 실제 라벨만 유효하게 취급.
+        valid_labels = {seg.speaker for seg in segments}
+        merges = {
+            src: dst
+            for src, dst in merges.items()
+            if src in valid_labels and dst in valid_labels and src != dst
+        }
 
-    logger.info("[%s] LLM 화자 병합 제안: %s (근거: %s)", provider, merges, reasoning)
-    return merges, reasoning
+        logger.info("[%s] LLM 화자 병합 제안: %s (근거: %s)", provider, merges, reasoning)
+        return merges, reasoning, provider
+
+    raise RuntimeError("모든 LLM 제공자 호출 실패: " + " / ".join(errors))
 
 
 def apply_merges(
