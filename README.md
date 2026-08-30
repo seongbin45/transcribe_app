@@ -223,6 +223,24 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
 - `gui/main_window.py`의 `MergeSuggestWorker`가 `self._settings.cross_validate_merges`를 읽어 `suggest_merges()`에 전달.
 - **검증**: 설정 다이얼로그 체크박스 ↔ `Settings.cross_validate_merges` ↔ `settings.json` 저장/재로드 왕복 확인, 실제 Gemini 무료 키로 `cross_validate=False` 호출 시 교차검증 관련 상태 메시지가 하나도 발생하지 않음(=호출 자체를 안 함)을 직접 확인.
 
+### 메인 화면: 파일 선택 버튼 깜빡임 + 실제 로딩 진행률 표시 (2026-08-31)
+
+**요청**: "메인 화면이 너무 복잡하므로, 사용자가 알기 쉽도록 파일 경로가 선택이 안되어있는 경우 '파일선택' 버튼이 깜빡이도록 해주시고. 로딩 진행률도 표시하도록 해주세요."
+
+**파일 선택 버튼 깜빡임** ([gui/main_window.py](transcribe_app/src/gui/main_window.py)):
+- `self._selected_path`가 없는 동안 500ms 간격 `QTimer`로 "파일 선택" 버튼 배경색을 켜고 끔(`_toggle_browse_blink`). 파일이 선택되면(`_set_selected_path`) 타이머를 멈추고 스타일을 원래대로 되돌림(`_stop_browse_blink`).
+- 헤드리스 스모크 테스트로 시작 시 깜빡임 활성화, 파일 선택 시 정지+스타일 초기화까지 확인.
+
+**실제 로딩 진행률**: 기존에는 모든 단계가 "돌아가는 중"만 보여주는 불확정(indeterminate) 진행바였음. 로컬 엔진(기본값)의 두 단계에 실제 진행률을 연결:
+- [core/engines/local_whisper.py](transcribe_app/src/core/engines/local_whisper.py)의 `transcribe()`에 `progress_callback(완료 윈도우 수, 전체 윈도우 수)` 추가 — VAD로 나눈 윈도우를 순차 처리하므로 "지금까지 처리한 윈도우 / 전체 윈도우"가 실제 진행률의 합리적인 근사치.
+- [core/engines/local_pyannote.py](transcribe_app/src/core/engines/local_pyannote.py)의 `diarize()`에 `progress_callback(내부 단계 이름, 완료, 전체)` 추가 — pyannote.audio Pipeline이 지원하는 `hook` 파라미터(콘솔에 진행률 바를 그리는 `ProgressHook`과 같은 메커니즘)를 그대로 활용해, 콘솔 대신 이 콜백으로 GUI에 전달.
+- `gui/main_window.py`의 `TranscribeWorker`에 `progress = Signal(int, int)` 추가, 두 콜백을 여기 연결. `MainWindow._on_transcribe_progress()`가 처음 신호를 받으면 진행바를 불확정 모드에서 0~100% 확정 모드로 전환.
+- 추출(ffmpeg)·API(AssemblyAI) 단계는 실제 진행률을 얻기 어려워 기존대로 불확정 표시 유지 — 억지로 가짜 퍼센트를 만들지 않음.
+
+**실제 발견한 버그(수정 완료)**: 실제 3분 클립(`output/validation/day1/personal_probe.wav`)으로 STT+화자분리 전체를 실제로 돌려 진행률 신호를 관찰하던 중, pyannote의 내부 배치가 겹쳐서 `done`이 그 순간의 `total`을 넘는 경우(예: 192/171)가 실제로 발생함을 확인. `QProgressBar.setValue()`는 범위를 벗어난 값을 조용히 무시하고 진행바를 `-1`(비정상 상태)로 남겨둔다는 것도 함께 확인 — `_on_transcribe_progress()`에서 퍼센트를 0~100으로 직접 클램프하도록 고쳐서 해결.
+
+**검증**: 헤드리스 스모크 테스트(불확정→확정 전환, `done>total` 클램프)에 더해, `TranscribeWorker`를 실제 오디오로 직접 실행해(threading 없이 `run()` 동기 호출) 실제 STT 7단계·화자분리 segmentation/embeddings 단계별 진행 신호가 순서대로 발생하고 상태 텍스트("전사 중... (5/7 구간)", "화자분리 중: embeddings (17/17)")가 올바르게 표시되는 것을 직접 확인.
+
 ### 화자분리 검증 관련 참고
 
 3단계 통합(STT + 화자분리 + 정렬)은 Windows 내장 TTS로 만든 합성 음성으로 파이프라인 자체(에러 없이 동작, 시간/텍스트/화자 라벨이 올바르게 병합되는지)는 확인했습니다. 다만 두 합성 음성(둘 다 여성 목소리)을 pyannote가 같은 화자로 묶는 경우가 있었는데, 이는 합성 음성이 실제 사람 목소리보다 음색 차이가 작고 클립이 짧아서(~20초) 생긴 현상으로 보입니다. **실제 화자분리 정확도는 실제 사람 목소리가 담긴 파일로 직접 확인이 필요**합니다.

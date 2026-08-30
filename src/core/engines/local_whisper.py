@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -71,7 +72,14 @@ class LocalWhisperEngine(STTEngine):
         languages: list[str],
         multilingual_mode: bool = False,
         window_seconds: float = 25.0,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[TranscriptSegment]:
+        """progress_callback(처리된 윈도우 수, 전체 윈도우 수)를 윈도우 하나 끝날 때마다 호출.
+
+        VAD 윈도우 단위로 순차 처리하기 때문에 "지금까지 처리한 윈도우 수 / 전체 윈도우 수"가
+        곧 실제 진행률의 합리적인 근사치다(윈도우 길이가 대체로 비슷해서 윈도우당 처리 시간도
+        비슷함). GUI의 "로딩 진행률 표시" 요청에 대응하기 위해 추가.
+        """
         audio = decode_audio(str(wav_path))
         speech_ts = get_speech_timestamps(
             audio, VadOptions(min_silence_duration_ms=500, speech_pad_ms=200)
@@ -81,9 +89,10 @@ class LocalWhisperEngine(STTEngine):
             return []
 
         windows = self._group_into_windows(speech_ts, window_seconds)
+        total_windows = len(windows)
         results: list[TranscriptSegment] = []
 
-        for w_start, w_end in windows:
+        for window_index, (w_start, w_end) in enumerate(windows, start=1):
             chunk = audio[w_start:w_end]
             segments, info = self.model.transcribe(
                 chunk,
@@ -118,6 +127,9 @@ class LocalWhisperEngine(STTEngine):
                         language_probability=lang_prob,
                     )
                 )
+
+            if progress_callback:
+                progress_callback(window_index, total_windows)
 
         return results
 

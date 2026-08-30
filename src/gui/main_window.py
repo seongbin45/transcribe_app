@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -106,6 +106,7 @@ class TranscribeWorker(QThread):
     succeeded = Signal(object)  # list[TranscriptSegment] | list[SpeakerTranscriptSegment]
     failed = Signal(str)
     status = Signal(str)
+    progress = Signal(int, int)  # (완료, 전체) — 로컬 엔진의 STT/화자분리 단계에서만 실제 값 전달
 
     def __init__(
         self,
@@ -147,10 +148,16 @@ class TranscribeWorker(QThread):
             compute_type="int8",
             download_root=DEFAULT_SETTINGS.models_dir,
         )
+
+        def _stt_progress(done: int, total: int) -> None:
+            self.progress.emit(done, total)
+            self.status.emit(f"전사 중... ({done}/{total} 구간)")
+
         segments = stt_engine.transcribe(
             self.wav_path,
             languages=self.languages,
             multilingual_mode=self.multilingual_mode,
+            progress_callback=_stt_progress,
         )
 
         if not self.diarize:
@@ -159,8 +166,16 @@ class TranscribeWorker(QThread):
 
         self.status.emit("화자분리 중... (pyannote 모델 로드/실행)")
         dia_engine = LocalPyannoteEngine(hf_token=get_hf_token())
+
+        def _dia_progress(step_name: str, done: int, total: int) -> None:
+            self.progress.emit(done, total)
+            self.status.emit(f"화자분리 중: {step_name} ({done}/{total})")
+
         speaker_segments = dia_engine.diarize(
-            self.wav_path, min_speakers=self.min_speakers, max_speakers=self.max_speakers
+            self.wav_path,
+            min_speakers=self.min_speakers,
+            max_speakers=self.max_speakers,
+            progress_callback=_dia_progress,
         )
         merged = assign_speakers(segments, speaker_segments)
         _relabel_speakers(merged)
@@ -243,11 +258,20 @@ class MainWindow(QMainWindow):
         self.path_edit = QLineEdit()
         self.path_edit.setReadOnly(True)
         self.path_edit.setPlaceholderText("선택된 파일 없음")
-        browse_btn = QPushButton("파일 선택")
-        browse_btn.clicked.connect(self._on_browse)
+        self.browse_btn = QPushButton("파일 선택")
+        self.browse_btn.clicked.connect(self._on_browse)
         file_row.addWidget(self.path_edit)
-        file_row.addWidget(browse_btn)
+        file_row.addWidget(self.browse_btn)
         layout.addLayout(file_row)
+
+        # 파일이 선택되지 않은 동안 '파일 선택' 버튼을 깜빡여서 다음에 뭘 해야 할지
+        # 바로 알 수 있게 함(화면 구성 요소가 많아 처음 보면 어디부터 시작할지 헷갈린다는
+        # 사용자 피드백 반영). 파일이 선택되면 _set_selected_path()에서 멈춘다.
+        self._browse_blink_on = False
+        self._browse_blink_timer = QTimer(self)
+        self._browse_blink_timer.setInterval(500)
+        self._browse_blink_timer.timeout.connect(self._toggle_browse_blink)
+        self._browse_blink_timer.start()
 
         self.extract_btn = QPushButton("오디오 추출 및 정보 확인")
         self.extract_btn.setEnabled(False)
@@ -424,10 +448,24 @@ class MainWindow(QMainWindow):
         if file_path:
             self._set_selected_path(Path(file_path))
 
+    def _toggle_browse_blink(self) -> None:
+        self._browse_blink_on = not self._browse_blink_on
+        if self._browse_blink_on:
+            self.browse_btn.setStyleSheet(
+                "background-color: #ffb300; color: black; font-weight: bold;"
+            )
+        else:
+            self.browse_btn.setStyleSheet("")
+
+    def _stop_browse_blink(self) -> None:
+        self._browse_blink_timer.stop()
+        self.browse_btn.setStyleSheet("")
+
     def _set_selected_path(self, path: Path) -> None:
         if not is_supported(path):
             QMessageBox.warning(self, "지원하지 않는 파일", f"지원하지 않는 확장자입니다: {path.suffix}")
             return
+        self._stop_browse_blink()
         self._selected_path = path
         self._wav_path = None
         self.path_edit.setText(str(path))
@@ -444,6 +482,7 @@ class MainWindow(QMainWindow):
         if self._selected_path is None:
             return
         self.extract_btn.setEnabled(False)
+        self.progress.setRange(0, 0)  # 추출 단계는 실제 진행률을 얻기 어려워 불확정(스피너) 표시
         self.progress.setVisible(True)
         self.statusBar().showMessage("오디오 추출 중... (ffmpeg)")
 
@@ -479,6 +518,7 @@ class MainWindow(QMainWindow):
 
         self.transcribe_btn.setEnabled(False)
         self.extract_btn.setEnabled(False)
+        self.progress.setRange(0, 0)  # 실제 진행률이 들어오기 전까지는 불확정(스피너) 표시
         self.progress.setVisible(True)
         self.transcript_box.clear()
         if s.engine_mode == "local" and model_size == "large-v3":
@@ -509,7 +549,19 @@ class MainWindow(QMainWindow):
         self._transcribe_worker.succeeded.connect(self._on_transcribe_done)
         self._transcribe_worker.failed.connect(self._on_transcribe_failed)
         self._transcribe_worker.status.connect(self.statusBar().showMessage)
+        self._transcribe_worker.progress.connect(self._on_transcribe_progress)
         self._transcribe_worker.start()
+
+    def _on_transcribe_progress(self, done: int, total: int) -> None:
+        if total <= 0:
+            return
+        if self.progress.maximum() == 0:  # 아직 불확정 모드면 확정 모드(0~100%)로 전환
+            self.progress.setRange(0, 100)
+        # pyannote 내부 단계는 배치가 겹쳐서 done이 그 순간의 total을 넘는 경우가 실제로
+        # 있었다(예: 192/171) — QProgressBar.setValue()는 범위 밖 값을 그냥 무시해버려서
+        # 클램프 없이는 진행률 표시가 깨진 채로 멈추는 걸 확인해서 여기서 직접 클램프한다.
+        pct = max(0, min(100, int(done / total * 100)))
+        self.progress.setValue(pct)
 
     def _on_transcribe_done(self, segments: list[TranscriptSegment]) -> None:
         self.progress.setVisible(False)
