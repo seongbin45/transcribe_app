@@ -4,10 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QGraphicsDropShadowEffect,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -38,6 +40,26 @@ from core.settings_store import load_settings, save_settings
 from gui.constants import EXPORT_FORMATS, MODEL_CHOICES
 from gui.widgets.merge_review_dialog import MergeReviewDialog
 from gui.widgets.settings_dialog import SettingsDialog
+
+
+# "다음 할 일" 버튼 깜빡임의 '떠오른' 상태 스타일 — 키캡(keycap)처럼 표면 위로 튀어나와
+# 보이도록, 위는 밝고 아래는 진한 그라디언트(빛이 위에서 온다고 가정)로 입체감을 주고,
+# 아래쪽에 진한 테두리를 둬서 눌리지 않은 볼록한 모서리처럼 보이게 한다.
+# 실제 그림자(box-shadow)는 QSS가 지원하지 않아서 QGraphicsDropShadowEffect로 별도 적용한다.
+_BLINK_RAISED_STYLE = """
+QPushButton {
+    background-color: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #ffe082, stop:0.45 #ffb300, stop:1 #ff8f00
+    );
+    border: 2px solid #e65100;
+    border-bottom: 3px solid #bf360c;
+    border-radius: 10px;
+    color: #3e2723;
+    font-weight: bold;
+    padding: 6px 14px;
+}
+"""
 
 
 def _format_duration(seconds: float) -> str:
@@ -461,14 +483,25 @@ class MainWindow(QMainWindow):
             timer.stop()
         self._blink_state[key] = False
         button.setStyleSheet("")
+        button.setGraphicsEffect(None)  # 이전 틱에서 붙였을 수 있는 그림자 제거
 
     def _toggle_blink(self, key: str, button: QPushButton) -> None:
+        """버튼을 반투명 그림자(QGraphicsDropShadowEffect)와 입체(키캡) 스타일로 튀어나오게
+        했다가, 평평한 원래 상태로 되돌리기를 반복 — 단순 색상 점멸보다 "눌러야 할 것"임을
+        더 뚜렷하게 전달하기 위함. QSS는 box-shadow를 지원하지 않아 그림자는 별도 이펙트로 적용.
+        """
         on = not self._blink_state.get(key, False)
         self._blink_state[key] = on
         if on:
-            button.setStyleSheet("background-color: #ffb300; color: black; font-weight: bold;")
+            button.setStyleSheet(_BLINK_RAISED_STYLE)
+            shadow = QGraphicsDropShadowEffect(button)
+            shadow.setBlurRadius(20)
+            shadow.setOffset(0, 5)
+            shadow.setColor(QColor(0, 0, 0, 150))
+            button.setGraphicsEffect(shadow)
         else:
             button.setStyleSheet("")
+            button.setGraphicsEffect(None)
 
     def _set_selected_path(self, path: Path) -> None:
         if not is_supported(path):
