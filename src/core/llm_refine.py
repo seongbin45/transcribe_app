@@ -311,6 +311,7 @@ def _run_consensus_check(
 def suggest_merges(
     segments: list[SpeakerTranscriptSegment],
     status_callback=None,
+    cross_validate: bool = True,
 ) -> tuple[list[MergeCandidate], str, str, str]:
     """LLM에게 화자 병합을 '제안'만 받아온다 (적용하지 않음).
 
@@ -321,10 +322,13 @@ def suggest_merges(
     각 제안은 원문에서 실제로 확인된 인용문(quote_src/quote_dst)이 있어야만
     후보로 남는다 — `_verify_and_filter_merges` 참고.
 
-    1차 응답에서 병합 제안이 하나라도 나오면, 가능한 경우 **다른 벤더**의 제공자에게
-    동일한 전사록을 독립적으로 다시 보여주고 두 제공자가 모두 동의한 것만 최종 후보로
-    남긴다(교차 제공자 컨센서스). 다른 벤더 키가 없거나 전부 실패하면 1차 결과만 쓰되
-    그 사실을 항상 consensus_note로 알린다.
+    cross_validate=True(기본값)이고 1차 응답에서 병합 제안이 하나라도 나오면, 가능한
+    경우 **다른 벤더**의 제공자에게 동일한 전사록을 독립적으로 다시 보여주고 두 제공자가
+    모두 동의한 것만 최종 후보로 남긴다(교차 제공자 컨센서스). 다른 벤더 키가 없거나
+    전부 실패하면 1차 결과만 쓰되 그 사실을 항상 consensus_note로 알린다.
+    cross_validate=False면(설정 화면에서 사용자가 끈 경우) 애초에 교차검증을 시도하지
+    않는다 — API 호출을 절반으로 줄이는 대신 단일 제공자 판단만 신뢰하게 됨을 의미하며,
+    이 트레이드오프도 consensus_note로 명시한다.
 
     반환: (최종 MergeCandidate 리스트, LLM이 남긴 판단 근거 텍스트, 1차 사용 슬롯 이름,
            교차검증 결과를 사람이 읽을 수 있게 설명하는 문자열)
@@ -378,6 +382,12 @@ def suggest_merges(
 
     if primary_slot is None or primary_resolved is None:
         raise RuntimeError("모든 LLM 제공자 호출 실패: " + " / ".join(errors))
+
+    if not cross_validate:
+        return (
+            primary_candidates, reasoning, primary_slot,
+            "교차검증 꺼짐(설정에서 비활성화됨) — 단일 제공자 결과만 사용합니다.",
+        )
 
     if not primary_candidates:
         return primary_candidates, reasoning, primary_slot, "제안된 병합이 없어 교차검증을 생략했습니다."

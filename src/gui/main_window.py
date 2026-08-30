@@ -190,14 +190,15 @@ class MergeSuggestWorker(QThread):
     failed = Signal(str)
     status = Signal(str)
 
-    def __init__(self, segments: list[SpeakerTranscriptSegment]):
+    def __init__(self, segments: list[SpeakerTranscriptSegment], cross_validate: bool = True):
         super().__init__()
         self.segments = segments
+        self.cross_validate = cross_validate
 
     def run(self) -> None:
         try:
             merges, reasoning, provider, consensus_note = suggest_merges(
-                self.segments, status_callback=self.status.emit
+                self.segments, status_callback=self.status.emit, cross_validate=self.cross_validate
             )
             self.succeeded.emit(merges, reasoning, provider, consensus_note)
         except Exception as e:  # noqa: BLE001
@@ -541,7 +542,9 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.statusBar().showMessage("LLM에게 화자 병합 제안 요청 중...")
 
-        self._merge_worker = MergeSuggestWorker(self._last_segments)
+        self._merge_worker = MergeSuggestWorker(
+            self._last_segments, cross_validate=self._settings.cross_validate_merges
+        )
         self._merge_worker.succeeded.connect(self._on_merge_suggest_done)
         self._merge_worker.failed.connect(self._on_merge_suggest_failed)
         self._merge_worker.status.connect(self.statusBar().showMessage)

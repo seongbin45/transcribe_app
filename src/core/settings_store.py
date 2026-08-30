@@ -16,6 +16,7 @@ _PERSISTED_FIELDS = [
     "api_provider",
     "whisper_model_size",
     "diarize_default",
+    "cross_validate_merges",
 ]
 
 

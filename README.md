@@ -213,6 +213,16 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
 
 **한계**: 호출 비용이 최대 2배(1차 + 교차검증)로 늘어남. 다른 벤더 키가 하나도 없으면(예: Gemini 키만 있는 환경) 컨센서스 없이 기존과 동일하게 동작 — 이 경우도 `consensus_note`로 명시됨.
 
+### 설정 화면에 교차검증 켜기/끄기 토글 추가 (2026-08-31)
+
+**요청**: "설정 화면에 교차검증 켜기/끄기 토글 추가해줘" — 위 컨센서스 기능이 API 호출을 최대 2배로 늘리는 트레이드오프가 있어서, 사용자가 직접 켜고 끌 수 있게 해달라는 후속 요청.
+
+- `core/config.py`의 `Settings`에 `cross_validate_merges: bool = True`(기본 켜짐 — 신뢰성 우선) 추가, `core/settings_store.py`의 `_PERSISTED_FIELDS`에도 반영해 `settings.json`에 저장.
+- `core/llm_refine.py`의 `suggest_merges()`에 `cross_validate: bool = True` 매개변수 추가 — `False`면 1차 응답 직후 교차검증을 아예 시도하지 않고 바로 반환(호출 자체가 안 나가므로 진짜로 절반으로 줄어듦), `consensus_note`에 "교차검증 꺼짐(설정에서 비활성화됨)"이라고 명시해 어떤 모드로 나온 결과인지 항상 알 수 있게 함.
+- [gui/widgets/settings_dialog.py](transcribe_app/src/gui/widgets/settings_dialog.py)의 "LLM 모델 (화자 병합 제안)" 그룹에 "다른 제공자로 교차검증 (권장)" 체크박스 추가, 툴팁으로 트레이드오프(호출 2배 vs 신뢰도) 설명.
+- `gui/main_window.py`의 `MergeSuggestWorker`가 `self._settings.cross_validate_merges`를 읽어 `suggest_merges()`에 전달.
+- **검증**: 설정 다이얼로그 체크박스 ↔ `Settings.cross_validate_merges` ↔ `settings.json` 저장/재로드 왕복 확인, 실제 Gemini 무료 키로 `cross_validate=False` 호출 시 교차검증 관련 상태 메시지가 하나도 발생하지 않음(=호출 자체를 안 함)을 직접 확인.
+
 ### 화자분리 검증 관련 참고
 
 3단계 통합(STT + 화자분리 + 정렬)은 Windows 내장 TTS로 만든 합성 음성으로 파이프라인 자체(에러 없이 동작, 시간/텍스트/화자 라벨이 올바르게 병합되는지)는 확인했습니다. 다만 두 합성 음성(둘 다 여성 목소리)을 pyannote가 같은 화자로 묶는 경우가 있었는데, 이는 합성 음성이 실제 사람 목소리보다 음색 차이가 작고 클립이 짧아서(~20초) 생긴 현상으로 보입니다. **실제 화자분리 정확도는 실제 사람 목소리가 담긴 파일로 직접 확인이 필요**합니다.

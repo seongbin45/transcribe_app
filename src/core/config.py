@@ -38,6 +38,10 @@ class Settings:
     whisper_model_size: str = "large-v3"
     diarize_default: bool = True
 
+    # 화자 병합 제안(LLM) 시 다른 벤더 제공자로 독립 재확인해 교집합만 남길지 여부.
+    # 기본 켜짐(신뢰성 우선) — 끄면 API 호출이 절반으로 줄지만 단일 모델 판단만 쓰게 됨.
+    cross_validate_merges: bool = True
+
     models_dir: Path = MODELS_DIR
     output_dir: Path = OUTPUT_DIR
 

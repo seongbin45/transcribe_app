@@ -108,6 +108,16 @@ class SettingsDialog(QDialog):
         llm_model_btn = QPushButton("LLM 모델 선택...")
         llm_model_btn.clicked.connect(self._on_open_llm_model_dialog)
         llm_layout.addWidget(llm_model_btn)
+
+        self.cross_validate_check = QCheckBox("다른 제공자로 교차검증 (권장)")
+        self.cross_validate_check.setToolTip(
+            "병합 제안을 준 제공자와 다른 벤더의 제공자에게 같은 전사록을 독립적으로\n"
+            "다시 보여줘서, 두 곳이 모두 동의한 병합만 남깁니다. LLM 판단을 그대로 믿지 않고\n"
+            "교차검증하기 위한 기능이라 API 호출이 최대 2배로 늘어납니다.\n"
+            "끄면 1차 제공자 판단만 사용합니다(호출은 절반, 신뢰도는 낮아짐)."
+        )
+        llm_layout.addWidget(self.cross_validate_check)
+
         layout.addWidget(llm_group)
 
         # --- 화자분리 기본값 ------------------------------------------------
@@ -137,6 +147,7 @@ class SettingsDialog(QDialog):
                 break
 
         self.diarize_default_check.setChecked(settings.diarize_default)
+        self.cross_validate_check.setChecked(settings.cross_validate_merges)
         self._refresh_api_status()
 
     def _refresh_api_status(self) -> None:
@@ -184,4 +195,5 @@ class SettingsDialog(QDialog):
         self._settings.engine_mode = "api" if self.api_radio.isChecked() else "local"
         self._settings.whisper_model_size = MODEL_CHOICES[self.model_combo.currentIndex()][1]
         self._settings.diarize_default = self.diarize_default_check.isChecked()
+        self._settings.cross_validate_merges = self.cross_validate_check.isChecked()
         return self._settings
