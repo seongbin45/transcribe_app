@@ -264,19 +264,17 @@ class MainWindow(QMainWindow):
         file_row.addWidget(self.browse_btn)
         layout.addLayout(file_row)
 
-        # 파일이 선택되지 않은 동안 '파일 선택' 버튼을 깜빡여서 다음에 뭘 해야 할지
-        # 바로 알 수 있게 함(화면 구성 요소가 많아 처음 보면 어디부터 시작할지 헷갈린다는
-        # 사용자 피드백 반영). 파일이 선택되면 _set_selected_path()에서 멈춘다.
-        self._browse_blink_on = False
-        self._browse_blink_timer = QTimer(self)
-        self._browse_blink_timer.setInterval(500)
-        self._browse_blink_timer.timeout.connect(self._toggle_browse_blink)
-        self._browse_blink_timer.start()
-
         self.extract_btn = QPushButton("오디오 추출 및 정보 확인")
         self.extract_btn.setEnabled(False)
         self.extract_btn.clicked.connect(self._on_extract)
         layout.addWidget(self.extract_btn)
+
+        # "지금 뭘 눌러야 하는지" 다음 단계 버튼을 깜빡여서 알려줌(화면 구성 요소가 많아
+        # 처음 보면 어디부터 시작할지 헷갈린다는 사용자 피드백 반영). 조건이 아직 안 갖춰졌거나
+        # (예: 파일 미선택) 그 단계가 이미 실행됐으면(예: 추출 완료) 깜빡이지 않는다.
+        self._blink_state: dict[str, bool] = {}
+        self._blink_timers: dict[str, QTimer] = {}
+        self._start_blink("browse", self.browse_btn)  # 시작 시엔 파일이 선택 안 되어 있음
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)  # indeterminate
@@ -448,24 +446,35 @@ class MainWindow(QMainWindow):
         if file_path:
             self._set_selected_path(Path(file_path))
 
-    def _toggle_browse_blink(self) -> None:
-        self._browse_blink_on = not self._browse_blink_on
-        if self._browse_blink_on:
-            self.browse_btn.setStyleSheet(
-                "background-color: #ffb300; color: black; font-weight: bold;"
-            )
-        else:
-            self.browse_btn.setStyleSheet("")
+    def _start_blink(self, key: str, button: QPushButton) -> None:
+        timer = self._blink_timers.get(key)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(500)
+            timer.timeout.connect(lambda: self._toggle_blink(key, button))
+            self._blink_timers[key] = timer
+        timer.start()
 
-    def _stop_browse_blink(self) -> None:
-        self._browse_blink_timer.stop()
-        self.browse_btn.setStyleSheet("")
+    def _stop_blink(self, key: str, button: QPushButton) -> None:
+        timer = self._blink_timers.get(key)
+        if timer is not None:
+            timer.stop()
+        self._blink_state[key] = False
+        button.setStyleSheet("")
+
+    def _toggle_blink(self, key: str, button: QPushButton) -> None:
+        on = not self._blink_state.get(key, False)
+        self._blink_state[key] = on
+        if on:
+            button.setStyleSheet("background-color: #ffb300; color: black; font-weight: bold;")
+        else:
+            button.setStyleSheet("")
 
     def _set_selected_path(self, path: Path) -> None:
         if not is_supported(path):
             QMessageBox.warning(self, "지원하지 않는 파일", f"지원하지 않는 확장자입니다: {path.suffix}")
             return
-        self._stop_browse_blink()
+        self._stop_blink("browse", self.browse_btn)
         self._selected_path = path
         self._wav_path = None
         self.path_edit.setText(str(path))
@@ -477,10 +486,13 @@ class MainWindow(QMainWindow):
         self.info_box.clear()
         self.transcript_box.clear()
         self.statusBar().showMessage(f"선택됨: {path.name}")
+        # 파일은 골랐지만 아직 추출을 안 했으니, 다음 할 일인 '오디오 추출' 버튼을 깜빡임
+        self._start_blink("extract", self.extract_btn)
 
     def _on_extract(self) -> None:
         if self._selected_path is None:
             return
+        self._stop_blink("extract", self.extract_btn)  # 이제 실행되니 깜빡임 중단
         self.extract_btn.setEnabled(False)
         self.progress.setRange(0, 0)  # 추출 단계는 실제 진행률을 얻기 어려워 불확정(스피너) 표시
         self.progress.setVisible(True)
@@ -504,6 +516,8 @@ class MainWindow(QMainWindow):
         self.extract_btn.setEnabled(True)
         self.statusBar().showMessage("오류 발생")
         QMessageBox.critical(self, "오류", message)
+        # 추출이 실패해서 아직 안 된 상태 그대로이니, 다시 눌러야 함을 알리기 위해 재개
+        self._start_blink("extract", self.extract_btn)
 
     def _on_transcribe(self) -> None:
         if self._wav_path is None:

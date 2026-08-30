@@ -227,9 +227,11 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
 
 **요청**: "메인 화면이 너무 복잡하므로, 사용자가 알기 쉽도록 파일 경로가 선택이 안되어있는 경우 '파일선택' 버튼이 깜빡이도록 해주시고. 로딩 진행률도 표시하도록 해주세요."
 
-**파일 선택 버튼 깜빡임** ([gui/main_window.py](transcribe_app/src/gui/main_window.py)):
-- `self._selected_path`가 없는 동안 500ms 간격 `QTimer`로 "파일 선택" 버튼 배경색을 켜고 끔(`_toggle_browse_blink`). 파일이 선택되면(`_set_selected_path`) 타이머를 멈추고 스타일을 원래대로 되돌림(`_stop_browse_blink`).
-- 헤드리스 스모크 테스트로 시작 시 깜빡임 활성화, 파일 선택 시 정지+스타일 초기화까지 확인.
+**"다음에 뭘 눌러야 하는지" 버튼 깜빡임** ([gui/main_window.py](transcribe_app/src/gui/main_window.py)):
+- 조건(예: 파일 미선택)이 갖춰지지 않았거나 그 단계가 아직 실행되지 않은 동안, 다음에 눌러야 할 버튼을 500ms 간격 `QTimer`로 깜빡임 — `_start_blink(key, button)`/`_stop_blink(key, button)`/`_toggle_blink(key, button)`으로 여러 버튼에 재사용 가능한 범용 메커니즘.
+- "파일 선택" 버튼: 파일이 선택 안 되어 있는 동안 깜빡임(`self._selected_path is None`). 파일을 고르면(`_set_selected_path`) 멈춤.
+- **"오디오 추출 및 정보 확인" 버튼(후속 요청, 2026-08-31)**: "경로가 선택되어 있고(조건 충족) + 아직 추출을 실행하지 않았을 때"만 깜빡이도록 추가. 파일을 고르면 시작(`_set_selected_path`에서 `_start_blink("extract", ...)`), 버튼을 눌러 추출이 시작되면 즉시 멈춤(`_on_extract`), 추출이 실패하면 다시 눌러야 하므로 재개(`_on_extract_failed`), 추출이 성공하면(다음 단계는 전사이므로) 다시 켜지 않음.
+- 헤드리스 스모크 테스트로 두 버튼의 전체 상태 전이(시작→선택→클릭→실패 재개→성공 시 미재개)를 모두 확인. 테스트 중 `QMessageBox.critical()`이 오프스크린 환경에서 이벤트 루프 없이 모달로 블로킹되어 테스트가 멈추는 현상을 발견했는데, 이는 실제 앱 동작(모달이 사용자 클릭을 기다리는 건 정상)이 아니라 무한 대기형 헤드리스 테스트 스크립트 자체의 한계라 `QMessageBox.critical`을 테스트에서만 무력화해서 확인함.
 
 **실제 로딩 진행률**: 기존에는 모든 단계가 "돌아가는 중"만 보여주는 불확정(indeterminate) 진행바였음. 로컬 엔진(기본값)의 두 단계에 실제 진행률을 연결:
 - [core/engines/local_whisper.py](transcribe_app/src/core/engines/local_whisper.py)의 `transcribe()`에 `progress_callback(완료 윈도우 수, 전체 윈도우 수)` 추가 — VAD로 나눈 윈도우를 순차 처리하므로 "지금까지 처리한 윈도우 / 전체 윈도우"가 실제 진행률의 합리적인 근사치.
