@@ -475,6 +475,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "지원하지 않는 파일", f"지원하지 않는 확장자입니다: {path.suffix}")
             return
         self._stop_blink("browse", self.browse_btn)
+        self._stop_blink("transcribe", self.transcribe_btn)  # 새 파일을 고르면 이전 추출 결과는 무효
         self._selected_path = path
         self._wav_path = None
         self.path_edit.setText(str(path))
@@ -510,6 +511,8 @@ class MainWindow(QMainWindow):
         self.transcribe_btn.setEnabled(True)
         self.info_box.setPlainText(_format_info(info) + f"\n\n추출된 STT용 오디오: {wav_path}")
         self.statusBar().showMessage("오디오 추출 완료. 전사를 시작할 수 있습니다.")
+        # 추출이 끝났고 아직 전사를 안 했으니, 다음 할 일인 '전사 시작' 버튼을 깜빡임
+        self._start_blink("transcribe", self.transcribe_btn)
 
     def _on_extract_failed(self, message: str) -> None:
         self.progress.setVisible(False)
@@ -530,6 +533,19 @@ class MainWindow(QMainWindow):
 
         model_size = MODEL_CHOICES[self.model_combo.currentIndex()][1]
 
+        min_speakers: int | None = None
+        max_speakers: int | None = None
+        if self.speaker_count_check.isChecked():
+            min_speakers = self.min_speakers_spin.value()
+            max_speakers = self.max_speakers_spin.value()
+            if min_speakers > max_speakers:
+                QMessageBox.warning(self, "입력 확인", "최소 화자 수가 최대 화자 수보다 큽니다.")
+                return
+
+        # 여기까지가 검증(위에서 return하면 아직 실행 전이므로 버튼/깜빡임/진행바를 건드리지
+        # 않는다 — 예전엔 검증보다 먼저 버튼을 비활성화해서, 화자 수 입력이 잘못됐을 때
+        # 경고만 뜨고 버튼이 계속 비활성 상태로 남는 문제가 있었음).
+        self._stop_blink("transcribe", self.transcribe_btn)  # 이제 실행되니 깜빡임 중단
         self.transcribe_btn.setEnabled(False)
         self.extract_btn.setEnabled(False)
         self.progress.setRange(0, 0)  # 실제 진행률이 들어오기 전까지는 불확정(스피너) 표시
@@ -539,15 +555,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("전사 중... (large-v3는 최초 실행 시 모델 다운로드로 시간이 걸릴 수 있습니다)")
         else:
             self.statusBar().showMessage("전사 중...")
-
-        min_speakers: int | None = None
-        max_speakers: int | None = None
-        if self.speaker_count_check.isChecked():
-            min_speakers = self.min_speakers_spin.value()
-            max_speakers = self.max_speakers_spin.value()
-            if min_speakers > max_speakers:
-                QMessageBox.warning(self, "입력 확인", "최소 화자 수가 최대 화자 수보다 큽니다.")
-                return
 
         self._transcribe_worker = TranscribeWorker(
             self._wav_path,
@@ -594,6 +601,8 @@ class MainWindow(QMainWindow):
         self.extract_btn.setEnabled(True)
         self.statusBar().showMessage("오류 발생")
         QMessageBox.critical(self, "오류", message)
+        # 전사가 실패해서 아직 안 된 상태 그대로이니, 다시 눌러야 함을 알리기 위해 재개
+        self._start_blink("transcribe", self.transcribe_btn)
 
     def _on_merge_suggest(self) -> None:
         if not get_provider_candidates():
