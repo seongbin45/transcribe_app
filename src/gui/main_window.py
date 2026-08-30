@@ -31,9 +31,11 @@ from core.engines.local_whisper import LocalWhisperEngine
 from core.exporters.docx_exporter import export_docx
 from core.exporters.markdown_exporter import export_markdown, export_txt
 from core.exporters.subtitle_exporter import export_srt, export_vtt
+from core.llm_refine import apply_merges, suggest_merges
 from core.secrets import get_api_key, get_hf_token
 from core.settings_store import load_settings, save_settings
 from gui.constants import EXPORT_FORMATS, MODEL_CHOICES
+from gui.widgets.merge_review_dialog import MergeReviewDialog
 from gui.widgets.settings_dialog import SettingsDialog
 
 
@@ -182,6 +184,23 @@ class TranscribeWorker(QThread):
         self.succeeded.emit(segments)
 
 
+class MergeSuggestWorker(QThread):
+    succeeded = Signal(dict, str)  # merges, reasoning
+    failed = Signal(str)
+
+    def __init__(self, segments: list[SpeakerTranscriptSegment], api_key: str):
+        super().__init__()
+        self.segments = segments
+        self.api_key = api_key
+
+    def run(self) -> None:
+        try:
+            merges, reasoning = suggest_merges(self.segments, self.api_key)
+            self.succeeded.emit(merges, reasoning)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(f"화자 병합 제안 요청 중 오류: {e}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -194,6 +213,7 @@ class MainWindow(QMainWindow):
         self._wav_path: Path | None = None
         self._worker: ExtractWorker | None = None
         self._transcribe_worker: TranscribeWorker | None = None
+        self._merge_worker: MergeSuggestWorker | None = None
         self._last_segments: list[TranscriptSegment] | list[SpeakerTranscriptSegment] = []
 
         self._build_ui()
@@ -288,6 +308,18 @@ class MainWindow(QMainWindow):
         self.transcript_box.setPlaceholderText("전사 결과가 여기에 표시됩니다.")
         layout.addWidget(self.transcript_box)
 
+        merge_row = QHBoxLayout()
+        self.merge_suggest_btn = QPushButton("화자 병합 제안 받기 (LLM, 실험적)")
+        self.merge_suggest_btn.setEnabled(False)
+        self.merge_suggest_btn.setToolTip(
+            "AssemblyAI API 키가 필요합니다. LLM이 문맥을 보고 화자 병합을 '제안'만 하며,\n"
+            "제안이 틀릴 수 있어 검토 창에서 직접 체크한 항목만 적용됩니다."
+        )
+        self.merge_suggest_btn.clicked.connect(self._on_merge_suggest)
+        merge_row.addWidget(self.merge_suggest_btn)
+        merge_row.addStretch()
+        layout.addLayout(merge_row)
+
         export_row = QHBoxLayout()
         export_row.addWidget(QLabel("내보내기 형식:"))
         self.export_format_combo = QComboBox()
@@ -375,6 +407,7 @@ class MainWindow(QMainWindow):
         self.extract_btn.setEnabled(True)
         self.transcribe_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
+        self.merge_suggest_btn.setEnabled(False)
         self._last_segments = []
         self.info_box.clear()
         self.transcript_box.clear()
@@ -454,6 +487,8 @@ class MainWindow(QMainWindow):
         self.extract_btn.setEnabled(True)
         self._last_segments = segments
         self.export_btn.setEnabled(bool(segments))
+        has_speakers = bool(segments) and hasattr(segments[0], "speaker")
+        self.merge_suggest_btn.setEnabled(has_speakers and bool(get_api_key(API_PROVIDERS[0])))
         self.transcript_box.setPlainText(_format_transcript(segments))
         self.statusBar().showMessage(f"전사 완료 ({len(segments)}개 구간)")
 
@@ -461,6 +496,42 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.transcribe_btn.setEnabled(True)
         self.extract_btn.setEnabled(True)
+        self.statusBar().showMessage("오류 발생")
+        QMessageBox.critical(self, "오류", message)
+
+    def _on_merge_suggest(self) -> None:
+        api_key = get_api_key(API_PROVIDERS[0])
+        if not api_key:
+            QMessageBox.warning(self, "API 키 필요", "설정에서 AssemblyAI API 키를 먼저 입력해주세요.")
+            return
+        if not self._last_segments:
+            return
+
+        self.merge_suggest_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        self.statusBar().showMessage("LLM에게 화자 병합 제안 요청 중...")
+
+        self._merge_worker = MergeSuggestWorker(self._last_segments, api_key)
+        self._merge_worker.succeeded.connect(self._on_merge_suggest_done)
+        self._merge_worker.failed.connect(self._on_merge_suggest_failed)
+        self._merge_worker.start()
+
+    def _on_merge_suggest_done(self, merges: dict, reasoning: str) -> None:
+        self.progress.setVisible(False)
+        self.merge_suggest_btn.setEnabled(True)
+        self.statusBar().showMessage("화자 병합 제안 도착")
+
+        dialog = MergeReviewDialog(self._last_segments, merges, reasoning, self)
+        if dialog.exec() == MergeReviewDialog.DialogCode.Accepted:
+            approved = dialog.approved_merges()
+            if approved:
+                self._last_segments = apply_merges(self._last_segments, approved)
+                self.transcript_box.setPlainText(_format_transcript(self._last_segments))
+                self.statusBar().showMessage(f"{len(approved)}건 병합 적용됨")
+
+    def _on_merge_suggest_failed(self, message: str) -> None:
+        self.progress.setVisible(False)
+        self.merge_suggest_btn.setEnabled(True)
         self.statusBar().showMessage("오류 발생")
         QMessageBox.critical(self, "오류", message)
 
