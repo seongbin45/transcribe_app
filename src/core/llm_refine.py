@@ -30,6 +30,17 @@ grounded citation/span-level verification 계열 연구(예: arxiv.org/abs/2408.
 보여주지도 않고 자동 폐기한다. 검증된 인용문은 리뷰 다이얼로그에 그대로 노출해서, 사람이 봐도
 "그럴듯해서" 그냥 승인해버리는 automation bias를 줄인다(리뷰 화면에 실제 근거를 보여주는 것 자체가
 "cognitive forcing function"이라는 human-in-the-loop 연구 결과 반영).
+
+교차 제공자 컨센서스(2026-08-31 추가): multi-agent debate/self-consistency 계열 연구는
+서로 다른 모델이 독립적으로 같은 결론에 도달했을 때 그 결론을 더 신뢰할 수 있다고 본다
+(예: ChatGPT와 Bard가 각각 따로 틀렸던 답이 교차 검증 후 정답으로 수렴한 사례 등).
+같은 벤더의 키 두 개(gemini_free/gemini)는 같은 모델이라 상관된 오류를 낼 수 있으므로,
+1차로 성공한 제공자와 **다른 벤더**의 제공자에게 동일한 전사록을 독립적으로 다시 보여주고,
+두 제공자가 모두 동의한(같은 화자 라벨 쌍을 제안한) 병합만 최종 후보로 남긴다
+(`_consensus_checker_candidates`/`_run_consensus_check`). 다른 벤더 키가 없거나 호출이
+전부 실패하면(예: 크레딧 부족) 조용히 1차 제공자 결과만 쓰는 것으로 후퇴하되, 그 사실을
+`consensus_note`로 항상 사용자에게 알린다 — 교차검증이 됐는지 안 됐는지 사용자가 항상 알 수
+있게 하는 것도 "AI에게 판단을 전부 맡기지 않는다"는 원칙의 일부다.
 """
 from __future__ import annotations
 
@@ -81,6 +92,7 @@ def _verify_quote(quote: str, normalized_source: str) -> bool:
     if len(q) < MIN_QUOTE_LEN:
         return False
     return _normalize_for_match(q) in normalized_source
+
 
 MAX_TRANSCRIPT_CHARS = 60000  # 매우 긴 녹음은 앞부분만 보고 병합 판단 (한계는 README에 명시)
 
@@ -250,27 +262,79 @@ def _verify_and_filter_merges(
     return result
 
 
+def _consensus_checker_candidates(
+    provider_candidates: list[tuple[str, ResolvedProvider]],
+    primary_slot: str,
+    primary_resolved: ResolvedProvider,
+) -> list[tuple[str, ResolvedProvider]]:
+    """1차 응답과 다른 "벤더"의 제공자만 교차검증 후보로 남긴다.
+
+    ResolvedProvider.id가 실제 API 벤더를 나타낸다(gemini_free도 id="gemini") — 같은
+    벤더의 키 두 개는 사실상 같은 모델이라 상관된 오류를 낼 수 있으므로 제외한다.
+    """
+    return [
+        (slot, resolved)
+        for slot, resolved in provider_candidates
+        if slot != primary_slot and resolved.id != primary_resolved.id
+    ]
+
+
+def _run_consensus_check(
+    user_content: str,
+    checker_pool: list[tuple[str, ResolvedProvider]],
+    segments: list[SpeakerTranscriptSegment],
+    status_callback=None,
+) -> tuple[str, list[MergeCandidate]] | None:
+    """checker_pool을 순서대로 시도해, 성공한 첫 제공자의 (슬롯, 검증된 후보)를 반환.
+
+    전부 실패하면(크레딧 부족 등) None — 호출 쪽이 1차 결과만 쓰는 것으로 후퇴한다.
+    """
+    for slot, resolved in checker_pool:
+        try:
+            if status_callback:
+                status_callback(f"교차검증({slot})용 모델 확인 중...")
+            model = ensure_selected_model(slot, resolved)
+
+            if status_callback:
+                status_callback(f"교차검증({slot}, {model}) 요청 중...")
+            max_attempts = RETRY_ATTEMPTS.get(slot, DEFAULT_RETRY_ATTEMPTS)
+            content = _call_with_retry(user_content, slot, resolved, model, max_attempts, status_callback)
+            parsed = json.loads(_strip_code_fence(content))
+            candidates = _verify_and_filter_merges(parsed.get("merges"), segments, slot)
+            return slot, candidates
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[교차검증] %s 호출 실패, 다음 후보로 넘어감: %s", slot, e)
+            continue
+    return None
+
+
 def suggest_merges(
     segments: list[SpeakerTranscriptSegment],
     status_callback=None,
-) -> tuple[list[MergeCandidate], str, str]:
+) -> tuple[list[MergeCandidate], str, str, str]:
     """LLM에게 화자 병합을 '제안'만 받아온다 (적용하지 않음).
 
     무료 Gemini 키 -> 일반 Gemini -> Claude -> OpenAI -> xAI 순으로 시도하고,
     (.env에 키가 없는 제공자는 건너뜀) 각 단계는 실패하면 다음으로 롤백한다.
     검증 결과 이 기능은 자동 적용하지 않고 사람이 검토 후 선택 적용하는 것을
     전제로 한다 (LLM이 가끔 존재하지 않는 화자 라벨을 지어내는 것을 확인했기 때문).
-    이제 각 제안은 원문에서 실제로 확인된 인용문(quote_src/quote_dst)이 있어야만
+    각 제안은 원문에서 실제로 확인된 인용문(quote_src/quote_dst)이 있어야만
     후보로 남는다 — `_verify_and_filter_merges` 참고.
 
-    반환: (검증된 MergeCandidate 리스트, LLM이 남긴 판단 근거 텍스트, 실제 사용된 슬롯 이름)
+    1차 응답에서 병합 제안이 하나라도 나오면, 가능한 경우 **다른 벤더**의 제공자에게
+    동일한 전사록을 독립적으로 다시 보여주고 두 제공자가 모두 동의한 것만 최종 후보로
+    남긴다(교차 제공자 컨센서스). 다른 벤더 키가 없거나 전부 실패하면 1차 결과만 쓰되
+    그 사실을 항상 consensus_note로 알린다.
+
+    반환: (최종 MergeCandidate 리스트, LLM이 남긴 판단 근거 텍스트, 1차 사용 슬롯 이름,
+           교차검증 결과를 사람이 읽을 수 있게 설명하는 문자열)
     """
     if not segments:
-        return [], "", ""
+        return [], "", "", ""
 
     provider_candidates = get_provider_candidates()
     if not provider_candidates:
-        return [], "", ""
+        return [], "", "", ""
 
     lines = []
     total = 0
@@ -283,6 +347,10 @@ def suggest_merges(
     user_content = "\n".join(lines)
 
     errors: list[str] = []
+    primary_slot: str | None = None
+    primary_resolved: ResolvedProvider | None = None
+    primary_candidates: list[MergeCandidate] = []
+    reasoning = ""
     for slot, resolved in provider_candidates:
         max_attempts = RETRY_ATTEMPTS.get(slot, DEFAULT_RETRY_ATTEMPTS)
         try:
@@ -300,12 +368,49 @@ def suggest_merges(
 
         parsed = json.loads(_strip_code_fence(content))
         reasoning = parsed.get("reasoning") or ""
-        merges = _verify_and_filter_merges(parsed.get("merges"), segments, slot)
+        primary_candidates = _verify_and_filter_merges(parsed.get("merges"), segments, slot)
+        primary_slot, primary_resolved = slot, resolved
+        logger.info(
+            "[%s] LLM 화자 병합 제안(증거 검증 후 %d건): %s (근거: %s)",
+            slot, len(primary_candidates), primary_candidates, reasoning,
+        )
+        break
 
-        logger.info("[%s] LLM 화자 병합 제안(증거 검증 후 %d건): %s (근거: %s)", slot, len(merges), merges, reasoning)
-        return merges, reasoning, slot
+    if primary_slot is None or primary_resolved is None:
+        raise RuntimeError("모든 LLM 제공자 호출 실패: " + " / ".join(errors))
 
-    raise RuntimeError("모든 LLM 제공자 호출 실패: " + " / ".join(errors))
+    if not primary_candidates:
+        return primary_candidates, reasoning, primary_slot, "제안된 병합이 없어 교차검증을 생략했습니다."
+
+    checker_pool = _consensus_checker_candidates(provider_candidates, primary_slot, primary_resolved)
+    if not checker_pool:
+        return (
+            primary_candidates, reasoning, primary_slot,
+            "교차검증 불가(다른 벤더의 API 키가 없음) — 단일 제공자 결과만 사용합니다.",
+        )
+
+    checker_result = _run_consensus_check(user_content, checker_pool, segments, status_callback)
+    if checker_result is None:
+        return (
+            primary_candidates, reasoning, primary_slot,
+            "교차검증을 시도했지만 다른 제공자 호출이 모두 실패해 단일 제공자 결과만 사용합니다.",
+        )
+
+    checker_slot, checker_candidates = checker_result
+    checker_pairs = {(c.src, c.dst) for c in checker_candidates}
+    agreed = [c for c in primary_candidates if (c.src, c.dst) in checker_pairs]
+    dropped = len(primary_candidates) - len(agreed)
+
+    if dropped:
+        note = (
+            f"{checker_slot}로 교차검증: {len(primary_candidates)}건 중 {len(agreed)}건 일치, "
+            f"{dropped}건은 다른 제공자가 동의하지 않아 제외했습니다."
+        )
+    else:
+        note = f"{checker_slot}로 교차검증: {len(agreed)}건 모두 일치했습니다."
+    logger.info("[교차검증] primary=%s checker=%s -> 최종 %d건 (%s)", primary_slot, checker_slot, len(agreed), note)
+
+    return agreed, reasoning, primary_slot, note
 
 
 def apply_merges(

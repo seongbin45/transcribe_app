@@ -186,7 +186,7 @@ class TranscribeWorker(QThread):
 
 
 class MergeSuggestWorker(QThread):
-    succeeded = Signal(list, str, str)  # list[MergeCandidate], reasoning, provider_used
+    succeeded = Signal(list, str, str, str)  # list[MergeCandidate], reasoning, provider_used, consensus_note
     failed = Signal(str)
     status = Signal(str)
 
@@ -196,8 +196,10 @@ class MergeSuggestWorker(QThread):
 
     def run(self) -> None:
         try:
-            merges, reasoning, provider = suggest_merges(self.segments, status_callback=self.status.emit)
-            self.succeeded.emit(merges, reasoning, provider)
+            merges, reasoning, provider, consensus_note = suggest_merges(
+                self.segments, status_callback=self.status.emit
+            )
+            self.succeeded.emit(merges, reasoning, provider, consensus_note)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(f"화자 병합 제안 요청 중 오류: {e}")
 
@@ -545,12 +547,14 @@ class MainWindow(QMainWindow):
         self._merge_worker.status.connect(self.statusBar().showMessage)
         self._merge_worker.start()
 
-    def _on_merge_suggest_done(self, candidates: list, reasoning: str, provider: str) -> None:
+    def _on_merge_suggest_done(
+        self, candidates: list, reasoning: str, provider: str, consensus_note: str
+    ) -> None:
         self.progress.setVisible(False)
         self.merge_suggest_btn.setEnabled(True)
-        self.statusBar().showMessage(f"화자 병합 제안 도착 (사용된 제공자: {provider})")
+        self.statusBar().showMessage(f"화자 병합 제안 도착 (1차 제공자: {provider})")
 
-        dialog = MergeReviewDialog(candidates, reasoning, self)
+        dialog = MergeReviewDialog(candidates, reasoning, self, consensus_note=consensus_note)
         if dialog.exec() == MergeReviewDialog.DialogCode.Accepted:
             approved = dialog.approved_merges()
             if approved:

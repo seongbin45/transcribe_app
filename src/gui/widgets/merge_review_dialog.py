@@ -7,6 +7,11 @@ LLM(특히 이 앱에서 실제로 접근 가능한 소형 모델)이 가끔 명
 이미 검증한 것만 남긴 것이다(원문에 없는 인용문이 확인되면 그 제안은 여기 도달하기 전에
 자동 폐기됨). 그래도 최종 판단은 사람이 직접 근거를 읽고 승인 여부를 정하도록 한다 —
 "그럴듯해 보이면 그냥 승인"하는 automation bias를 줄이기 위해 실제 근거를 보여준다.
+
+consensus_note는 다른 벤더의 제공자에게 같은 전사록을 독립적으로 다시 물어봤을 때(교차
+제공자 컨센서스, core/llm_refine.py의 suggest_merges 참고) 두 제공자가 얼마나 일치했는지
+알려준다 — 교차검증이 실제로 됐는지, 아니면 다른 키가 없어서/실패해서 단일 제공자 결과만
+쓴 것인지 사람이 항상 알 수 있게 한다.
 """
 from __future__ import annotations
 
@@ -24,7 +29,13 @@ from core.llm_refine import MergeCandidate
 
 
 class MergeReviewDialog(QDialog):
-    def __init__(self, candidates: list[MergeCandidate], reasoning: str, parent=None):
+    def __init__(
+        self,
+        candidates: list[MergeCandidate],
+        reasoning: str,
+        parent=None,
+        consensus_note: str = "",
+    ):
         super().__init__(parent)
         self.setWindowTitle("화자 병합 제안 검토 (LLM)")
         self.setMinimumSize(560, 420)
@@ -41,6 +52,12 @@ class MergeReviewDialog(QDialog):
         )
         warn.setWordWrap(True)
         layout.addWidget(warn)
+
+        if consensus_note:
+            consensus_label = QLabel(f"교차검증: {consensus_note}")
+            consensus_label.setWordWrap(True)
+            consensus_label.setStyleSheet("color: #b06000; font-weight: bold;")
+            layout.addWidget(consensus_label)
 
         if reasoning:
             reasoning_label = QLabel(f"LLM 판단 근거(전체 요약): {reasoning}")
