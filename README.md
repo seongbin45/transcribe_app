@@ -133,20 +133,30 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
 - GUI: 전사 완료 후(화자분리 결과 + Gemini 키 있을 때) "화자 병합 제안 받기 (LLM, 실험적)" 버튼 활성화
 - 매우 긴 녹음은 전사록이 6만자를 넘으면 앞부분만 잘라서 판단 (`MAX_TRANSCRIPT_CHARS`)
 
-### Gemini 모델 카탈로그: 모델명 하드코딩 제거 (2026-08-31)
+### LLM 모델/제공자: 하드코딩 제거 + xai/openai/gemini/claude 전체 폴백 체인 (2026-08-31)
 
-**겪은 문제**: `gemini-2.5-flash`를 코드에 문자열로 박아뒀는데, 어느 순간 무료 키에서 "신규 사용자에게 더 이상 제공되지 않음 — `gemini-3.6-flash`를 쓰라"는 404 오류가 남(API 응답 메시지가 직접 안내). 모델명이 이렇게 자주 바뀌는데 코드에 박아두면 바뀔 때마다 코드를 고쳐야 함.
+**겪은 문제**: `gemini-2.5-flash`를 코드에 문자열로 박아뒀는데, 어느 순간 무료 키에서 "신규 사용자에게 더 이상 제공되지 않음"이라는 404 오류가 남(API 응답 메시지가 직접 다음 모델을 안내). 모델명이 이렇게 자주 바뀌는데 코드에 박아두면 바뀔 때마다 코드를 고쳐야 함.
 
-**해결**: `C:\...\Automating_automatic_message_sending\src\aam\catalog.py`(다른 프로젝트, xai/openai/gemini/claude 여러 제공자를 지원하는 범용 CLI 도구)의 설계를 참고해 [core/llm_catalog.py](transcribe_app/src/core/llm_catalog.py)를 만듦 — 이 앱은 Gemini만 쓰므로 그 부분만 단순화:
+**해결(1차, Gemini만)**: `C:\...\Automating_automatic_message_sending\src\aam\catalog.py`(다른 프로젝트, xai/openai/gemini/claude 여러 제공자를 지원하는 범용 CLI 도구)의 설계를 참고해 [core/llm_catalog.py](transcribe_app/src/core/llm_catalog.py)를 만듦.
 
-- `fetch_gemini_models(api_key)`: `GET /v1beta/models`로 그 키가 실제 쓸 수 있는 모델 목록을 실시간으로 가져옴 (텍스트 생성 미지원 모델은 제외)
-- **목록에 있다고 실제로 호출된다는 보장은 없음을 실제로 확인**: `gemini-2.5-flash`가 여전히 목록엔 있지만 무료 키로 실제 호출하면 404가 남. 그래서 자동 선택 시 후보를 실제로 한 번 호출해서 검증(`_probe_model`) — 영구적 오류(404/400)는 다음 후보로 넘어가고, 일시적 오류(429/503)는 몇 번 재시도 후 판단
-- `ensure_selected_model(provider, api_key)`: 저장된 선택이 없으면 `flash`가 들어간 모델부터 최대 6개까지 실제로 검증해보고 처음 성공하는 걸 자동 선택
-- 선택 결과는 `transcribe_app/llm_selection.json`에 provider(`gemini_free`/`gemini`)별로 저장 — 무료 키와 일반 키가 접근 가능한 모델이 실제로 다를 수 있어서 따로 저장함 (git에는 커밋 안 됨, `.gitignore`)
-- 저장해둔 모델이 나중에 막히면(404) 자동으로 선택을 지워서 다음 실행 때 다시 고르게 함 (`clear_selected_model`, `core/llm_refine.py`의 재시도 로직에 연결)
-- **실제 키로 전 과정 검증**: 빈 상태에서 시작 → 실시간 목록 조회(39개) → `gemini-2.5-flash`는 검증 호출에서 실패 → 후보를 넘어가며 시도 → `gemini-3-flash-preview`에서 성공 → 저장 → 화자 병합 제안까지 정상 완료
+**해결(2차, 전체 제공자로 확장)**: "API 키 연결 로직을 모두 반영하라"는 요청에 따라, `aam`의 `settings.py`(제공자 레지스트리)까지 통째로 이식해서 xai/openai/claude도 폴백 후보로 추가:
 
-**다음 단계(예정)**: 지금은 자동 선택만 있고, 설정 화면에서 사용자가 실시간 목록을 보고 직접 모델을 고르는 UI는 아직 없음 — "차근차근히" 진행 중이라 이 부분은 다음 단계로 남겨둠.
+- [core/llm_providers.py](transcribe_app/src/core/llm_providers.py): `aam/settings.py`를 그대로 이식 — `PROVIDERS` 레지스트리(제공자별 env var 이름: `XAI_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`), `resolve_provider()`, `configured_providers()`
+- [core/llm_call.py](transcribe_app/src/core/llm_call.py): 제공자별로 다른 실제 채팅 API 포맷(OpenAI 호환 Chat Completions / Claude Messages API / Gemini generateContent)을 `call_llm()` 하나로 통일
+- [core/llm_catalog.py](transcribe_app/src/core/llm_catalog.py): 모델 목록 조회도 제공자별로 분기(`fetch_openai_compatible`, `fetch_claude`, `fetch_gemini_models`) → `fetch_models()`
+- **폴백 체인** (`core/llm_refine.py`의 `get_provider_candidates()`): `gemini_free`(이 앱 전용, 25회 재시도) → `gemini` → `claude` → `openai` → `xai` 순. `.env`에 키가 없는 제공자는 자동으로 건너뜀
+- 모델 선택은 슬롯(`gemini_free`/`gemini`/`claude`/`openai`/`xai`)별로 `llm_selection.json`에 저장 — 같은 Gemini라도 무료 키/일반 키가 접근 가능한 모델이 다를 수 있어서 따로 저장
+
+**실제 키로 4개 제공자 전부 검증(2026-08-31)**:
+- **openai**: 모델 124개 조회, `gpt-4.1-mini` 자동 선택 및 실제 채팅 호출 성공
+- **gemini / gemini_free**: 위와 동일하게 정상 동작
+- **claude**: 모델 목록(10개)은 정상 조회되지만 실제 채팅 호출은 "크레딧 부족"(400, 계정 과금 문제 — 코드 버그 아님)으로 실패 → 폴백 체인이 정상적으로 다음 제공자로 넘어감을 확인
+- **xai**: 모델 목록 조회 자체가 403 "팀에 크레딧/라이선스 없음"으로 실패(계정 문제) → 마찬가지로 정상적으로 건너뜀
+- **실제로 겪은 버그 2개, 모두 수정**:
+  1. **자동 선택 키워드 버그**: 저렴한 모델을 우선 고르려고 `"mini"`를 키워드로 썼는데, "gemini"라는 단어 자체에 `"mini"`가 들어있어서(ge**mini**) 사실상 모든 Gemini 모델이 걸리는 문제 발견 → `"-mini"`처럼 하이픈을 붙여서 수정. 이미지/음성 전용 모델(`-image`, `-tts` 등)도 자동 선택 후보에서 제외하도록 추가
+  2. **Gemini "thinking" 토큰이 응답 예산을 다 먹는 문제**: `gemini-2.5-flash`가 내부적으로 생각하는 토큰을 먼저 쓰고 남는 걸로 답을 만드는데, `maxOutputTokens`가 부족해서 JSON 응답이 중간에 잘리는 걸(`Unterminated string` 파싱 오류) 실제로 겪음 → `thinkingConfig.thinkingBudget: 0`으로 비활성화 + `max_tokens`를 700→1500으로 상향해서 해결
+
+**다음 단계(예정)**: 지금은 자동 선택만 있고, 설정 화면에서 사용자가 실시간 목록을 보고 직접 모델/제공자 순서를 고르는 UI는 아직 없음 — "차근차근히" 진행 중이라 이 부분은 다음 단계로 남겨둠.
 
 ### 화자분리 검증 관련 참고
 
