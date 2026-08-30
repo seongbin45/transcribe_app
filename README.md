@@ -282,6 +282,16 @@ Day 1과 같은 방식으로 Day 2~4의 개인녹음/제공파일(각 15분, 총
 - 실제 ffmpeg 추출로 `extract` 단계도 검증 — 시드(RTF 0.05)보다 실제로 훨씬 빨랐음(관찰된 RTF 0.007), 마찬가지로 자기보정 확인.
 - **테스트 중 발견한 실수(앱 버그 아님, 유의사항으로 기록)**: 검증 스크립트가 처음에 로컬 엔진을 명시적으로 강제하지 않아서, 이 프로젝트의 실제 `settings.json`에 저장돼 있던 `engine_mode: "api"` 설정을 그대로 물려받아 **실제 AssemblyAI API를 한 번 호출**하는 일이 있었음(3분짜리 테스트 클립, 적은 비용으로 추정). 이후 테스트에서 `engine_mode`를 명시적으로 `"local"`로 강제해서 재검증했고, 이 일은 즉시 사용자에게 알림 — 실제 서비스 키를 쓰는 코드를 헤드리스로 검증할 때는 항상 엔진 모드를 명시적으로 고정해야 한다는 교훈.
 
+### AssemblyAI 10시간 길이 제한 사전 검사 (2026-08-31, 실사용 오류 리포트)
+
+**증상**: 사용자가 실제로 API 엔진(AssemblyAI)으로 **10시간 31분 8초**짜리 녹음 파일(`Day_4/2026년_8월_27일.m4a`)을 전사하다가 "전사 중 오류: Audio duration is too long."이라는 영문 오류 메시지를 그대로 받음 — 원인도 대안도 알 수 없는 상태로 실패.
+
+**원인 조사**: AssemblyAI 공식 문서([FAQ: Are there any limits on file size or file duration?](https://www.assemblyai.com/docs/faq/are-there-any-limits-on-file-size-or-file-duration-for-files-submitted-to-the-api))를 확인한 결과, `/v2/transcript`는 **단일 요청당 최대 10시간**까지만 받고, 초과하면 업로드 이후 잡 상태가 `error`가 되면서 정확히 이 영문 메시지를 반환함. 사용자의 파일(10:31:08)은 이 한도를 31분 8초 초과 — 큰 파일을 업로드하고 한참 기다린 뒤(폴링 끝에)에야 실패를 알게 되는 구조였음.
+
+**수정**: [core/engines/assemblyai_engine.py](transcribe_app/src/core/engines/assemblyai_engine.py)에 `_check_duration()` 추가 — `transcribe()`/`transcribe_with_diarization()` 시작 시 업로드 전에 `probe_media()`로 길이를 먼저 확인하고, 10시간을 넘으면 즉시(네트워크 호출 없이) 한국어로 원인과 대안(파일을 10시간 이하로 나누거나, 설정에서 로컬 엔진으로 전환 — 로컬 엔진은 이런 길이 제한이 없음)을 알려주는 `AssemblyAIError`를 던짐.
+
+**검증**: 실제 3분 클립으로는 검사를 조용히 통과함(정상 파일에 영향 없음)을 확인. 사용자가 겪은 것과 정확히 같은 길이(10시간 31분 8초)로 시뮬레이션해 `AssemblyAIError`가 "10시간 31분 8초로 그보다 깁니다..." 메시지와 함께 발생하고, `requests.post`가 단 한 번도 호출되지 않는 것(=업로드 자체가 시도되지 않음)을 `transcribe()`/`transcribe_with_diarization()` 양쪽 모두에서 확인.
+
 ### 화자분리 검증 관련 참고
 
 3단계 통합(STT + 화자분리 + 정렬)은 Windows 내장 TTS로 만든 합성 음성으로 파이프라인 자체(에러 없이 동작, 시간/텍스트/화자 라벨이 올바르게 병합되는지)는 확인했습니다. 다만 두 합성 음성(둘 다 여성 목소리)을 pyannote가 같은 화자로 묶는 경우가 있었는데, 이는 합성 음성이 실제 사람 목소리보다 음색 차이가 작고 클립이 짧아서(~20초) 생긴 현상으로 보입니다. **실제 화자분리 정확도는 실제 사람 목소리가 담긴 파일로 직접 확인이 필요**합니다.
