@@ -27,10 +27,50 @@ BASE_URL = "https://api.pyannote.ai"
 POLL_INTERVAL_SEC = 3
 POLL_TIMEOUT_SEC = 3600
 UPLOAD_TIMEOUT_SEC = 900
+JOB_POLL_REQUEST_TIMEOUT_SEC = 45  # 실사용 중 30초에서 read timeout이 실제로 발생해 여유를 둠(아래 참고)
+
+# 실사용 중(2026-08-31) 10시간 넘는 파일을 여러 시간 폴링하다가 도중에 단 한 번의
+# 네트워크 순간 지연(Read timed out)만으로 전체 작업이 실패로 끝나는 걸 실제로 겪음.
+# 폴링은 최대 1200번(3600초 / 3초)까지 반복 호출되므로, 그 긴 시간 동안 일시적인 지연이
+# 한 번도 없을 거라고 가정하는 게 오히려 비현실적 — 그래서 연결 오류/타임아웃처럼 재시도로
+# 해결될 수 있는 예외만 지수 백오프로 몇 번 더 시도한 뒤에도 안 되면 그때 포기한다
+# (서버가 4xx/5xx를 명시적으로 준 경우는 재시도해도 소용없으므로 그대로 즉시 실패 처리).
+MAX_TRANSIENT_RETRIES = 5
+RETRY_BACKOFF_BASE_SEC = 3
 
 
 class PyannoteAIError(RuntimeError):
     pass
+
+
+def _request_with_retries(
+    method: str,
+    url: str,
+    *,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    max_retries: int = MAX_TRANSIENT_RETRIES,
+    **kwargs,
+) -> requests.Response:
+    """일시적 네트워크 오류(타임아웃/연결 끊김)에 한해서만 지수 백오프로 재시도.
+
+    서버가 실제로 응답은 했지만 4xx/5xx인 경우는 재시도해도 결과가 바뀌지 않으므로
+    여기서 건드리지 않고 그대로 반환한다 — 상태 코드 판정은 호출부에서 기존처럼 처리.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return requests.request(method, url, **kwargs)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if attempt == max_retries:
+                break
+            wait = RETRY_BACKOFF_BASE_SEC * attempt
+            if progress_callback:
+                progress_callback(f"네트워크 오류, {wait}초 후 재시도 중 ({attempt}/{max_retries}회)", 0, 1)
+            time.sleep(wait)
+    raise PyannoteAIError(
+        f"pyannoteAI 요청이 네트워크 오류로 {max_retries}회 재시도 후에도 실패했습니다: {last_exc}"
+    ) from last_exc
 
 
 class PyannoteAIEngine(DiarizationEngine):
@@ -49,7 +89,7 @@ class PyannoteAIEngine(DiarizationEngine):
     ) -> list[SpeakerSegment]:
         if progress_callback:
             progress_callback("업로드 중", 0, 1)
-        media_url = self._upload(wav_path)
+        media_url = self._upload(wav_path, progress_callback)
 
         if progress_callback:
             progress_callback("화자분리 요청 중", 0, 1)
@@ -70,7 +110,14 @@ class PyannoteAIEngine(DiarizationEngine):
             if max_speakers is not None:
                 payload["maxSpeakers"] = max_speakers
 
-        resp = requests.post(f"{BASE_URL}/v1/diarize", headers=self._headers, json=payload, timeout=60)
+        resp = _request_with_retries(
+            "post",
+            f"{BASE_URL}/v1/diarize",
+            headers=self._headers,
+            json=payload,
+            timeout=60,
+            progress_callback=progress_callback,
+        )
         if resp.status_code >= 400:
             raise PyannoteAIError(f"pyannoteAI 화자분리 요청 실패({resp.status_code}): {resp.text[:500]}")
 
@@ -85,12 +132,19 @@ class PyannoteAIEngine(DiarizationEngine):
             for seg in output
         ]
 
-    def _upload(self, wav_path: Path) -> str:
+    def _upload(
+        self, wav_path: Path, progress_callback: Callable[[str, int, int], None] | None = None
+    ) -> str:
         # media:// 스킴의 임의 고유 키 — pyannoteAI가 내부적으로 이 키에 대응하는
         # 사전 서명 업로드 URL을 발급해준다(48시간 뒤 자동 삭제).
         media_key = f"media://transcribe-app-{uuid.uuid4().hex}"
-        resp = requests.post(
-            f"{BASE_URL}/v1/media/input", headers=self._headers, json={"url": media_key}, timeout=30
+        resp = _request_with_retries(
+            "post",
+            f"{BASE_URL}/v1/media/input",
+            headers=self._headers,
+            json={"url": media_key},
+            timeout=30,
+            progress_callback=progress_callback,
         )
         if resp.status_code >= 400:
             raise PyannoteAIError(f"pyannoteAI 업로드 URL 요청 실패({resp.status_code}): {resp.text[:500]}")
@@ -99,8 +153,25 @@ class PyannoteAIEngine(DiarizationEngine):
         if not presigned_url:
             raise PyannoteAIError("pyannoteAI가 업로드용 URL을 내려주지 않았습니다.")
 
-        with open(wav_path, "rb") as f:
-            put_resp = requests.put(presigned_url, data=f, timeout=UPLOAD_TIMEOUT_SEC)
+        # PUT은 파일 핸들을 스트리밍으로 소비하므로(재시도 시 새로 열어야 함) 위
+        # _request_with_retries 헬퍼를 그대로 못 쓰고 직접 재시도 루프를 돈다.
+        last_exc: Exception | None = None
+        for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
+            try:
+                with open(wav_path, "rb") as f:
+                    put_resp = requests.put(presigned_url, data=f, timeout=UPLOAD_TIMEOUT_SEC)
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                if attempt == MAX_TRANSIENT_RETRIES:
+                    raise PyannoteAIError(
+                        f"pyannoteAI로 오디오 업로드가 네트워크 오류로 {MAX_TRANSIENT_RETRIES}회 재시도 후에도 "
+                        f"실패했습니다: {e}"
+                    ) from e
+                wait = RETRY_BACKOFF_BASE_SEC * attempt
+                if progress_callback:
+                    progress_callback(f"업로드 네트워크 오류, {wait}초 후 재시도 중 ({attempt}/{MAX_TRANSIENT_RETRIES}회)", 0, 1)
+                time.sleep(wait)
         if put_resp.status_code >= 400:
             raise PyannoteAIError(f"pyannoteAI로 오디오 업로드 실패({put_resp.status_code})")
 
@@ -109,7 +180,17 @@ class PyannoteAIEngine(DiarizationEngine):
     def _poll(self, job_id: str, progress_callback: Callable[[str, int, int], None] | None = None) -> list[dict]:
         elapsed = 0
         while elapsed < POLL_TIMEOUT_SEC:
-            resp = requests.get(f"{BASE_URL}/v1/jobs/{job_id}", headers=self._headers, timeout=30)
+            # 폴링은 (최대 1시간 / 3초 간격 =) 최대 1200번까지 반복 호출되므로, 그 동안
+            # 일시적인 네트워크 지연이 한 번쯤 있는 게 오히려 자연스럽다 — 실사용 중
+            # 실제로 read timeout 한 번에 여러 시간 걸린 작업 전체가 실패하는 걸 겪어서
+            # (아래 참고), 연결 오류/타임아웃만 재시도로 흡수한다.
+            resp = _request_with_retries(
+                "get",
+                f"{BASE_URL}/v1/jobs/{job_id}",
+                headers=self._headers,
+                timeout=JOB_POLL_REQUEST_TIMEOUT_SEC,
+                progress_callback=progress_callback,
+            )
             if resp.status_code >= 400:
                 raise PyannoteAIError(f"pyannoteAI 작업 조회 실패({resp.status_code}): {resp.text[:500]}")
 
