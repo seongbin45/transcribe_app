@@ -422,6 +422,12 @@ class MainWindow(QMainWindow):
         # 실행 전/실시간 예상 소요 시간 표시용 — core/perf_profile.py 참고.
         self._eta_tracker: _EtaTracker | None = None
         self._eta_stage: str | None = None
+        # 진행바가 뒤로 튀지 않도록 하는 워터마크(현재 단계에서 지금까지 보여준 최댓값).
+        # 로컬 화자분리는 pyannote 내부 단계(segmentation -> embeddings 등)가 바뀔 때마다
+        # done/total이 다시 0부터 시작해서, 클램프 없이 그대로 표시하면 진행바가
+        # 예: 100% -> 50%처럼 눈에 띄게 뒤로 튀는 문제가 실측으로 확인됐다(단계가 바뀔
+        # 때마다 _on_stage_started에서 0으로 리셋).
+        self._progress_watermark = 0
         self._eta_timer = QTimer(self)
         self._eta_timer.setInterval(1000)
         self._eta_timer.timeout.connect(self._update_eta_label)
@@ -884,6 +890,14 @@ class MainWindow(QMainWindow):
         # 있었다(예: 192/171) — QProgressBar.setValue()는 범위 밖 값을 그냥 무시해버려서
         # 클램프 없이는 진행률 표시가 깨진 채로 멈추는 걸 확인해서 여기서 직접 클램프한다.
         pct = max(0, min(100, int(done / total * 100)))
+        # 로컬 화자분리는 pyannote 내부 단계(segmentation -> embeddings 등)가 바뀔 때마다
+        # done/total이 다시 0부터 시작해서, 그대로 표시하면 진행바가 예: 100% -> 50%처럼
+        # 눈에 띄게 뒤로 튀는 게 실측으로 확인됐다(2026-08-31, 사용자 리포트). 워터마크로
+        # 현재 단계 안에서는 절대 뒤로 가지 않게 막는다 — 다음 내부 단계가 이전 단계의
+        # 마지막 표시값을 다시 넘어설 때까지는 잠깐 멈춰 보일 수 있지만, 뒤로 튀는 것보다
+        # 자연스럽다(표준적인 진행바 UX).
+        pct = max(pct, self._progress_watermark)
+        self._progress_watermark = pct
         self.progress.setValue(pct)
 
         # STT 단계(로컬 CPU/GPU "stt"/"stt_gpu", Groq "groq_stt")는 done/total이 뚝뚝
@@ -903,6 +917,10 @@ class MainWindow(QMainWindow):
         # 문제가 있었다(실사용 중 발견). 실제 진행률이 들어오는 단계(stt/diarize 등)는
         # 곧바로 _on_transcribe_progress가 다시 확정(0~100%) 모드로 바꿔주므로 문제 없다.
         self.progress.setRange(0, 0)
+        # 뒤로 튀지 않게 막는 워터마크도 매 단계 시작마다 0으로 되돌린다 — 새 단계는
+        # 이전 단계 값과 무관하게 처음부터 다시 채워져야 하므로(예: stt 100% 다음 diarize는
+        # 0%부터 시작해야 함), 이건 같은 단계 "안"에서만 뒤로 안 가게 막는 것과는 별개다.
+        self._progress_watermark = 0
         self._start_eta(stage, pre_estimate_sec)
 
     def _on_stage_done(self, stage: str, elapsed_sec: float) -> None:
