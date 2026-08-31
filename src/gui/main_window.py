@@ -896,6 +896,13 @@ class MainWindow(QMainWindow):
             self._update_eta_label()
 
     def _on_stage_started(self, stage: str, pre_estimate_sec: float) -> None:
+        # 새 단계가 시작될 때마다 진행바를 일단 불확정(스피너) 모드로 되돌린다. 예:
+        # Groq STT 단계가 100%로 끝난 뒤 pyannoteAI 화자분리 단계로 넘어가면, 그 단계는
+        # 실제 퍼센트를 안 주므로(progress.emit을 호출하지 않음) 리셋을 안 하면 이전
+        # 단계의 100%가 그대로 얼어붙은 채 남아 "업로드 중"인데 진행바만 100%로 보이는
+        # 문제가 있었다(실사용 중 발견). 실제 진행률이 들어오는 단계(stt/diarize 등)는
+        # 곧바로 _on_transcribe_progress가 다시 확정(0~100%) 모드로 바꿔주므로 문제 없다.
+        self.progress.setRange(0, 0)
         self._start_eta(stage, pre_estimate_sec)
 
     def _on_stage_done(self, stage: str, elapsed_sec: float) -> None:
